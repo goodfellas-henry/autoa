@@ -1,0 +1,15 @@
+{
+  "name": "autoa-keeper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AutoA の運用ロボット（範囲の追従と手数料の回収）",
+  "scripts": {
+    "start": "node keeper.js",
+    "new-keeper": "node new-keeper.js",
+    "status": "node keeper.js --status"
+  },
+  "dependencies": {
+    "ethers": "6.13.4"
+  }
+}

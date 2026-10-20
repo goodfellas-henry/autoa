@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoA</title>
+<style>
+:root{--ink:#1c2230;--sub:#5d6573;--line:#dde1e7;--bg:#f5f6f8;--card:#fff;--accent:#1f5fbf;--accent-soft:#e8effb;--good:#1e7a46;--good-soft:#e9f6ee;--warn:#a85d00;--warn-soft:#fff4e3;--bad:#b42318;--bad-soft:#fdeceb}
+@media (prefers-color-scheme: dark){:root{--ink:#e8eaee;--sub:#a3a9b4;--line:#2e3440;--bg:#14171c;--card:#1c2027;--accent:#6ea0f0;--accent-soft:#1f2c42;--good:#5cc489;--good-soft:#173024;--warn:#f0b35c;--warn-soft:#33270f;--bad:#f07c72;--bad-soft:#3a1a18}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;font-size:15px;line-height:1.6}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0 0;letter-spacing:.02em}
+h1 small{font-size:13px;color:var(--sub);font-weight:500;margin-left:6px}
+.tag{color:var(--sub);font-size:13px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:16px;margin:0 0 10px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.row .k{color:var(--sub);flex-shrink:0}
+.row .v{font-weight:600;text-align:right;word-break:break-all}
+label{display:block;font-size:13px;color:var(--sub);margin:10px 0 4px}
+input,select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:15px;background:var(--card);color:var(--ink)}
+button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;background:var(--accent);color:#fff;margin-top:12px;cursor:pointer}
+button.sec{background:var(--accent-soft);color:var(--accent)}
+button.danger{background:var(--bad)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.note{font-size:13px;color:var(--sub);margin-top:8px}
+.box{border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13.5px}
+.info{background:var(--accent-soft)}.ok{background:var(--good-soft);color:var(--good)}.warn{background:var(--warn-soft);color:var(--warn)}.err{background:var(--bad-soft);color:var(--bad)}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:600}
+.pill.in{background:var(--good-soft);color:var(--good)}.pill.out{background:var(--warn-soft);color:var(--warn)}.pill.none{background:var(--line);color:var(--sub)}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;word-break:break-all}
+details summary{cursor:pointer;font-weight:600;padding:4px 0}
+.hidden{display:none}
+#bar{position:relative;height:34px;margin:14px 0 4px;background:var(--line);border-radius:6px}
+#barRange{position:absolute;top:0;bottom:0;background:var(--good-soft);border:2px solid var(--good);border-radius:6px}
+#barNow{position:absolute;top:-6px;bottom:-6px;width:3px;background:var(--accent);border-radius:2px}
+.barlbl{display:flex;justify-content:space-between;font-size:12px;color:var(--sub)}
+#log{font-size:13px}
+</style>
+</head>
+<body>
+<main>
+  <h1>AutoA<small>オートア</small></h1>
+  <div class="tag">自分専用の Uniswap 自動運用（Base）。引き出しはあなただけができます。</div>
+
+  <!-- 接続 -->
+  <div class="card">
+    <div class="row"><span class="k">財布</span><span class="v" id="acct">未接続</span></div>
+    <div class="row"><span class="k">ネットワーク</span><span class="v" id="net">-</span></div>
+    <button id="btnConnect">MetaMask をつなぐ</button>
+    <div id="netWarn" class="box warn hidden">ネットワークが Base ではありません。<button class="sec" id="btnSwitch">Base に切り替える</button></div>
+  </div>
+
+  <!-- 金庫を選ぶ / 作る -->
+  <div class="card hidden" id="pickCard">
+    <h2>金庫</h2>
+    <div id="savedWrap" class="hidden">
+      <label>保存済みの金庫</label>
+      <select id="savedList"></select>
+      <button class="sec" id="btnOpenSaved">この金庫を開く</button>
+    </div>
+    <details id="addExisting" style="margin-top:10px">
+      <summary>住所を入力して金庫を開く</summary>
+      <input id="vaultAddr" placeholder="0x..." style="margin-top:8px">
+      <button class="sec" id="btnOpen">開く</button>
+    </details>
+    <details id="createBox" style="margin-top:10px">
+      <summary>新しく金庫を作る</summary>
+      <label>運用するペア</label>
+      <select id="newPair">
+        <option value="usdc">ETH / USDC（ドルとの組み合わせ）</option>
+        <option value="cbbtc">BTC / ETH（仮想通貨どうし）</option>
+      </select>
+      <label>手数料の区分（使えるものだけ表示されます）</label>
+      <select id="newFee"><option value="">確認中…</option></select>
+      <label>範囲の広さ</label>
+      <select id="newWidth">
+        <option value="0.01">とても狭い（±1%）</option>
+        <option value="0.02">狭い（±2%）</option>
+        <option value="0.03" selected>標準（±3%）</option>
+        <option value="0.05">広い（±5%）</option>
+        <option value="0.10">とても広い（±10%）</option>
+      </select>
+      <div class="note" id="pairNote"></div>
+      <label>ロボットの住所（サーバーで表示された 0x...）</label>
+      <input id="newKeeper" placeholder="0x...">
+      <button id="btnDeploy">金庫を作る（MetaMask で承認）</button>
+    </details>
+  </div>
+
+  <!-- 状況 -->
+  <div class="card hidden" id="statusCard">
+    <h2><span id="sPair">-</span> <span id="pill" class="pill none">-</span></h2>
+    <div id="barWrap" class="hidden">
+      <div id="bar"><div id="barRange"></div><div id="barNow"></div></div>
+      <div class="barlbl"><span id="barMin"></span><span id="barMax"></span></div>
+    </div>
+    <div class="row"><span class="k" id="sPriceLbl">価格</span><span class="v" id="sPrice">-</span></div>
+    <div class="row"><span class="k">運用している範囲</span><span class="v" id="sRange">-</span></div>
+    <div class="row"><span class="k">運用中の中身</span><span class="v" id="sPos">-</span></div>
+    <div class="row"><span class="k">未回収の手数料</span><span class="v" id="sFees">-</span></div>
+    <div class="row"><span class="k">金庫の待機分</span><span class="v" id="sIdle">-</span></div>
+    <div class="row"><span class="k">合計</span><span class="v" id="sTotal">-</span></div>
+    <div class="row"><span class="k">ロボット</span><span class="v mono" id="sKeeper">-</span></div>
+    <div class="row"><span class="k">金庫の住所</span><span class="v mono" id="sVault">-</span></div>
+    <button class="sec" id="btnRefresh">最新の状態に更新</button>
+    <div id="oracleWarn" class="box warn hidden">このプールは平均価格の記録が足りないため、安全確認ができません。下のボタンで記録の準備をし、10分ほど待ってから運用を始めてください。<button class="sec" id="btnOracle">価格記録を準備する</button></div>
+    <div id="notOwner" class="box warn hidden">いまつないでいる財布は、この金庫の持ち主ではありません。操作するには持ち主の財布でつないでください。</div>
+  </div>
+
+  <!-- 操作 -->
+  <div class="card hidden ownerOnly" id="startCard">
+    <h2>運用を始める</h2>
+    <label>入れる ETH の量</label>
+    <input id="startAmt" type="number" min="0" step="0.001" placeholder="例：0.01">
+    <div class="note" id="startNote">入れた ETH の半分を自動で相手の通貨に交換し、今の価格を中心に預けます。交換で受け取る量が想定より 1% 以上少ない場合は自動で中止されます。</div>
+    <button id="btnStart">運用を始める</button>
+  </div>
+
+  <div class="card hidden ownerOnly" id="manageCard">
+    <h2>操作</h2>
+    <label>追加で入れる ETH の量</label>
+    <input id="addAmt" type="number" min="0" step="0.001" placeholder="例：0.01">
+    <button class="sec" id="btnAdd">資金を追加する</button>
+    <button class="sec" id="btnCollect">手数料を今すぐ回収する</button>
+    <label style="margin-top:16px"><input type="checkbox" id="unwrap" checked style="width:auto"> WETH は ETH に戻して受け取る</label>
+    <button class="danger" id="btnExit">全部引き出して終了する</button>
+    <div class="note">「全部引き出す」は運用を止め、中身をすべてあなたの財布へ送ります。</div>
+  </div>
+
+  <div class="card hidden ownerOnly" id="settingsCard">
+    <details>
+      <summary>設定（詳しい方向け）</summary>
+      <div class="grid2">
+        <div><label>範囲の広さ</label>
+          <select id="setWidth"><option value="0.01">とても狭い（±1%）</option><option value="0.02">狭い（±2%）</option><option value="0.03">標準（±3%）</option><option value="0.05">広い（±5%）</option><option value="0.10">とても広い（±10%）</option></select></div>
+        <div><label>手数料の受け取り方</label>
+          <select id="setFees"><option value="1">財布に送る</option><option value="0">金庫に貯めて再投資</option></select></div>
+        <div><label>組み直しの最短間隔（分）</label><input id="setInterval" type="number" min="0" max="1440"></div>
+        <div><label>価格の安定チェック（期間・分）</label><input id="setTwap" type="number" min="1" max="60"></div>
+      </div>
+      <div class="note">範囲の広さの変更は、次の組み直しから反映されます。今すぐ反映したい場合は「全部引き出す」→「運用を始める」をやり直してください。</div>
+      <button class="sec" id="btnSaveParams">設定を保存する</button>
+      <label style="margin-top:16px">ロボットの住所を変更</label>
+      <input id="setKeeper" placeholder="0x...">
+      <button class="sec" id="btnSetKeeper">ロボットを変更する</button>
+      <button class="sec" id="btnPause">ロボットを一時停止する</button>
+      <button class="danger" id="btnRescue">緊急：運用中のポジションを自分の財布へ移す</button>
+      <div class="note">緊急用です。移した後は Uniswap の公式サイト（app.uniswap.org）で自分で管理できます。</div>
+    </details>
+  </div>
+
+  <div class="card"><h2>お知らせ</h2><div id="log" class="note">MetaMask をつないでください。</div></div>
+</main>
+<script src="ethers.umd.min.js"></script>
+<script src="vault-artifact.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
