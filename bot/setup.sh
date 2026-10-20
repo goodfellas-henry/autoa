@@ -27,7 +27,7 @@ if [ $# -eq 0 ]; then
   if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]; then
     $SUDO apt-get update -y
     $SUDO apt-get install -y ca-certificates curl gnupg
-    curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO -E bash -
+    if [ -n "$SUDO" ]; then curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -; else curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; fi
     $SUDO apt-get install -y nodejs
   fi
   echo "=== 2/3 ロボットの部品を入れています ==="

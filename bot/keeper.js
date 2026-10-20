@@ -81,6 +81,26 @@ async function notify(text) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 公開の接続口は一度に大量の問い合わせを受けると失敗することがあるため、
+// 読み取りは1つずつ順番に行い、失敗したら少し待ってやり直す
+async function read(fn, tries = 4) {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (i >= tries - 1) throw e;
+      await sleep(1500 * (i + 1));
+    }
+  }
+}
+async function readAll(fns) {
+  const out = [];
+  for (const f of fns) out.push(await read(f));
+  return out;
+}
+
 function fmt(n) {
   return n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toPrecision(4);
 }
@@ -93,11 +113,11 @@ function shortErr(e) {
 // ---------------------------------------------------------------- 金庫ごとの準備
 async function prepareVault(addr, wallet, provider) {
   const vault = new ethers.Contract(addr, VAULT_ABI, wallet);
-  const [keeperOnChain, t0, t1, weth, fee] = await Promise.all([
-    vault.keeper(), vault.token0(), vault.token1(), vault.weth(), vault.fee(),
+  const [keeperOnChain, t0, t1, weth, fee] = await readAll([
+    () => vault.keeper(), () => vault.token0(), () => vault.token1(), () => vault.weth(), () => vault.fee(),
   ]);
   const c0 = new ethers.Contract(t0, ERC20_ABI, provider), c1 = new ethers.Contract(t1, ERC20_ABI, provider);
-  const [dec0, dec1, s0, s1] = await Promise.all([c0.decimals(), c1.decimals(), c0.symbol(), c1.symbol()]);
+  const [dec0, dec1, s0, s1] = await readAll([() => c0.decimals(), () => c1.decimals(), () => c0.symbol(), () => c1.symbol()]);
   const sym0 = niceSym(s0), sym1 = niceSym(s1);
   const wethIs0 = t0.toLowerCase() === weth.toLowerCase();
   const quoteIsUsd = /USD/i.test(wethIs0 ? sym1 : sym0);
@@ -122,8 +142,9 @@ async function prepareVault(addr, wallet, provider) {
 }
 
 async function snapshot(v) {
-  const [pid, lo, hi, tick, inR, paused] = await Promise.all([
-    v.vault.positionId(), v.vault.tickLower(), v.vault.tickUpper(), v.vault.currentTick(), v.vault.inRange(), v.vault.paused(),
+  const [pid, lo, hi, tick, inR, paused] = await readAll([
+    () => v.vault.positionId(), () => v.vault.tickLower(), () => v.vault.tickUpper(),
+    () => v.vault.currentTick(), () => v.vault.inRange(), () => v.vault.paused(),
   ]);
   const a = v.priceOf(lo), b = v.priceOf(hi);
   return { pid, paused, inRange: inR, price: v.priceOf(tick), lo: Math.min(a, b), hi: Math.max(a, b) };
@@ -152,8 +173,8 @@ async function main() {
       process.exit(1);
     }
   }
-  const provider = new ethers.JsonRpcProvider(cfg.rpc);
-  const net = await provider.getNetwork();
+  const provider = new ethers.JsonRpcProvider(cfg.rpc, undefined, { batchMaxCount: 1 });
+  const net = await read(() => provider.getNetwork());
   if (net.chainId !== cfg.expectedChainId) {
     console.error(`つながっているネットワークが違います（chainId ${net.chainId}、期待値 ${cfg.expectedChainId}）。`);
     process.exit(1);
@@ -164,11 +185,15 @@ async function main() {
   const vaults = [];
   for (const a of cfg.vaults) vaults.push(await prepareVault(a, wallet, provider));
 
-  const describeAll = async () => (await Promise.all(vaults.map(async (v) => describe(v, await snapshot(v))))).join("\n");
+  const describeAll = async () => {
+    const lines = [];
+    for (const v of vaults) lines.push(describe(v, await snapshot(v)));
+    return lines.join("\n");
+  };
 
   if (process.argv.includes("--status")) {
     console.log(await describeAll());
-    const bal = await provider.getBalance(wallet.address);
+    const bal = await read(() => provider.getBalance(wallet.address));
     console.log(`ロボットのガス代残高: ${ethers.formatEther(bal)} ETH`);
     return;
   }
@@ -191,7 +216,7 @@ async function main() {
   }
 
   async function checkVault(v) {
-    if (await v.vault.needsRebalance()) {
+    if (await read(() => v.vault.needsRebalance())) {
       const before = await snapshot(v);
       const rc = await send(v, "rebalance");
       const after = await snapshot(v);
@@ -201,17 +226,17 @@ async function main() {
     }
     if (cfg.collectHours > 0 && Date.now() - v.lastCollect > cfg.collectHours * 3600e3) {
       v.lastCollect = Date.now();
-      const [pid, paused] = await Promise.all([v.vault.positionId(), v.vault.paused()]);
+      const [pid, paused] = await readAll([() => v.vault.positionId(), () => v.vault.paused()]);
       if (pid !== 0n && !paused) {
         const rc = await send(v, "collectFees");
-        const toOwner = await v.vault.feesToOwner();
+        const toOwner = await read(() => v.vault.feesToOwner());
         await notify(`💰 [${v.name}] 手数料を回収しました（${toOwner ? "持ち主の財布へ送金" : "金庫に保管"}）。\n${EXPLORER}${rc.hash}`);
       }
     }
   }
 
   async function round() {
-    const bal = await provider.getBalance(wallet.address);
+    const bal = await read(() => provider.getBalance(wallet.address));
     if (Number(ethers.formatEther(bal)) < cfg.lowGasEth && Date.now() - lastLowGasWarn > 6 * 3600e3) {
       lastLowGasWarn = Date.now();
       await notify(`⛽ ロボットのガス代が少なくなっています（${ethers.formatEther(bal)} ETH）。\nBase の ETH を ${wallet.address} に少し送ってください。`);
