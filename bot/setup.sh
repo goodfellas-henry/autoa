@@ -10,6 +10,8 @@
 #              （金庫を増やすときも、全部の住所を並べてもう一度実行）
 #   成績:    bash setup.sh start 0.01 0.01
 #            → 各金庫に入れた ETH の量を登録し、毎朝の定期報告に成績を載せます
+#   自動更新: bash setup.sh autoupdate
+#            → GitHub の新しい版を1時間ごとに自動で取り込むようにします
 # =====================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -73,6 +75,37 @@ if [ "$1" = "start" ]; then
   chmod 600 .env
   echo "入れた ETH の量を登録しました: $LIST"
   restart_if_running
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 自動更新
+if [ "$1" = "autoupdate" ]; then
+  chmod +x "$BOT_DIR/update.sh"
+  $SUDO tee /etc/systemd/system/autoa-update.service >/dev/null <<UNIT
+[Unit]
+Description=AutoA keeper auto update
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash $BOT_DIR/update.sh
+UNIT
+  $SUDO tee /etc/systemd/system/autoa-update.timer >/dev/null <<UNIT
+[Unit]
+Description=AutoA keeper auto update (hourly)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now autoa-update.timer >/dev/null
+  echo "自動更新を設定しました。GitHub が更新されると、1時間以内にロボットが自動で最新になります。"
+  echo "  止めるとき: systemctl disable --now autoa-update.timer"
   exit 0
 fi
 
