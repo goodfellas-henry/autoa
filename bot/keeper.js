@@ -33,7 +33,12 @@ const cfg = {
   lowGasEth: Number(process.env.LOW_GAS_WARN_ETH || 0.0003),
   discord: process.env.DISCORD_WEBHOOK_URL || "",
   expectedChainId: BigInt(process.env.CHAIN_ID || 8453),
+  // 定期報告を送る時刻（日本時間の「時」。off にすると REPORT_EVERY_HOURS の間隔で送る）
+  reportHourJst: (process.env.REPORT_HOUR_JST || "9").trim(),
+  // 各金庫に入れた ETH の量（VAULT_ADDRESS と同じ順に、カンマ区切り）。成績の比べる相手になる
+  startEth: (process.env.START_ETH || "").split(/[\s,]+/).filter(Boolean).map(Number),
 };
+const STATE_FILE = path.join(here, "state.json");
 const EXPLORER = cfg.expectedChainId === 8453n ? "https://basescan.org/tx/" : "tx: ";
 
 const VAULT_ABI = [
@@ -51,6 +56,9 @@ const VAULT_ABI = [
   "function currentTick() view returns (int24)",
   "function inRange() view returns (bool)",
   "function needsRebalance() view returns (bool)",
+  "function positionManager() view returns (address)",
+  "function pool() view returns (address)",
+  "event FeesCollected(uint256 amount0, uint256 amount1, bool sentToOwner)",
   "function rebalance()",
   "function collectFees()",
   "error PriceUnstable(int24 tick, int24 twapTick)",
@@ -60,7 +68,34 @@ const VAULT_ABI = [
   "error NoPosition()",
   "error NotKeeperOrOwner()",
 ];
-const ERC20_ABI = ["function decimals() view returns (uint8)", "function symbol() view returns (string)"];
+const ERC20_ABI = [
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+  "function balanceOf(address) view returns (uint256)",
+];
+const NPM_ABI = [
+  "function positions(uint256) view returns (uint96, address, address, address, uint24, int24, int24, uint128 liquidity, uint256, uint256, uint128, uint128)",
+  "function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)",
+];
+const POOL_ABI = ["function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool)"];
+const MAX128 = (1n << 128n) - 1n;
+
+// ---------------------------------------------------------------- 記録（成績の計算用）
+// 持ち主の財布へ送った手数料は金庫から出ていくので、ここに足し上げて成績に含める
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch (_) { return {}; }
+}
+function saveState(st) {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2)); } catch (e) { console.log("記録の保存に失敗:", e.message); }
+}
+
+// 集中流動性の「預けている量」を計算する（Uniswap V3 の公式どおり）
+export function amountsFor(L, sqrtP, tickLo, tickHi) {
+  const a = Math.sqrt(Math.pow(1.0001, Number(tickLo))), b = Math.sqrt(Math.pow(1.0001, Number(tickHi)));
+  if (sqrtP <= a) return [(L * (b - a)) / (a * b), 0];
+  if (sqrtP >= b) return [0, L * (b - a)];
+  return [(L * (b - sqrtP)) / (sqrtP * b), L * (sqrtP - a)];
+}
 
 // ---------------------------------------------------------------- 便利関数
 const now = () => new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
@@ -130,7 +165,13 @@ async function prepareVault(addr, wallet, provider) {
     return baseIs0 ? p : 1 / p;
   };
   const name = `${base}/${quote}`;
-  const v = { addr, vault, name, base, quote, quoteIsUsd, priceOf, lastCollect: Date.now() };
+  const [npmAddr, poolAddr] = await readAll([() => vault.positionManager(), () => vault.pool()]);
+  const v = {
+    addr, vault, name, base, quote, quoteIsUsd, priceOf, lastCollect: Date.now(),
+    c0, c1, dec0: Number(dec0), dec1: Number(dec1), wethIs0,
+    npm: new ethers.Contract(npmAddr, NPM_ABI, provider),
+    pool: new ethers.Contract(poolAddr, POOL_ABI, provider),
+  };
 
   log(`金庫 ${name}（手数料 ${Number(fee) / 10000}%）: ${addr}`);
   if (keeperOnChain.toLowerCase() !== wallet.address.toLowerCase()) {
@@ -148,6 +189,52 @@ async function snapshot(v) {
   ]);
   const a = v.priceOf(lo), b = v.priceOf(hi);
   return { pid, paused, inRange: inR, price: v.priceOf(tick), lo: Math.min(a, b), hi: Math.max(a, b) };
+}
+
+// 金庫の中身（預けている分＋未回収の手数料＋待機分）を ETH の量に換算する
+async function valueInEth(v, provider) {
+  const [slot, pid, lo, hi, b0, b1, ethRaw] = await readAll([
+    () => v.pool.slot0(), () => v.vault.positionId(), () => v.vault.tickLower(), () => v.vault.tickUpper(),
+    () => v.c0.balanceOf(v.addr), () => v.c1.balanceOf(v.addr), () => provider.getBalance(v.addr),
+  ]);
+  const sqrtP = Number(slot.sqrtPriceX96) / 2 ** 96;
+  let a0 = Number(b0), a1 = Number(b1); // 生の単位
+  if (pid !== 0n) {
+    const pos = await read(() => v.npm.positions(pid));
+    const [p0, p1] = amountsFor(Number(pos.liquidity), sqrtP, lo, hi);
+    a0 += p0; a1 += p1;
+    try {
+      const r = await read(() =>
+        v.npm.collect.staticCall({ tokenId: pid, recipient: v.addr, amount0Max: MAX128, amount1Max: MAX128 }, { from: v.addr })
+      );
+      a0 += Number(r[0]); a1 += Number(r[1]);
+    } catch (_) {}
+  }
+  return toEth(v, a0, a1, sqrtP) + Number(ethers.formatEther(ethRaw));
+}
+
+// token0/token1 の生の量を、今の価格で ETH の量に直す
+export function toEth(v, raw0, raw1, sqrtP) {
+  const p = sqrtP * sqrtP; // 1 token0 あたりの token1（生の単位）
+  return v.wethIs0 ? (raw0 + raw1 / p) / 1e18 : (raw1 + raw0 * p) / 1e18;
+}
+
+function resultText(v, totalEth, st, start) {
+  const sent = st.sentToOwnerEth?.[v.addr.toLowerCase()] || 0;
+  const all = totalEth + sent;
+  let line = `　ETH 換算の合計: ${all.toFixed(6)} ETH`;
+  if (sent > 0) line += `（うち財布へ送った手数料 ${sent.toFixed(6)}）`;
+  if (start > 0) {
+    const pct = ((all - start) / start) * 100;
+    const mark = pct > 0.05 ? "🟢" : pct < -0.05 ? "🔴" : "⚪";
+    line += `\n　入れた ${start} ETH と比べて: ${mark} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%（${all - start >= 0 ? "+" : ""}${(all - start).toFixed(6)} ETH）`;
+  }
+  const prev = st.lastTotal?.[v.addr.toLowerCase()];
+  if (typeof prev === "number" && prev > 0) {
+    const d = ((all - prev) / prev) * 100;
+    line += `\n　前回の報告から: ${d >= 0 ? "+" : ""}${d.toFixed(2)}%`;
+  }
+  return { line, all };
 }
 
 function priceText(v, n) {
@@ -185,22 +272,44 @@ async function main() {
   const vaults = [];
   for (const a of cfg.vaults) vaults.push(await prepareVault(a, wallet, provider));
 
-  const describeAll = async () => {
+  const state = loadState();
+  state.sentToOwnerEth ||= {};
+  state.lastTotal ||= {};
+
+  // withResult: 成績（ETH 換算）も付ける。save: 「前回の報告」として記録する
+  const describeAll = async ({ withResult = false, save = false } = {}) => {
     const lines = [];
-    for (const v of vaults) lines.push(describe(v, await snapshot(v)));
+    for (const [i, v] of vaults.entries()) {
+      lines.push(describe(v, await snapshot(v)));
+      if (!withResult) continue;
+      try {
+        const { line, all } = resultText(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0);
+        lines.push(line);
+        if (save) state.lastTotal[v.addr.toLowerCase()] = all;
+      } catch (e) {
+        lines.push(`　（成績の計算に失敗しました: ${shortErr(e)}）`);
+      }
+    }
+    if (save) saveState(state);
     return lines.join("\n");
   };
 
   if (process.argv.includes("--status")) {
-    console.log(await describeAll());
+    console.log(await describeAll({ withResult: true }));
     const bal = await read(() => provider.getBalance(wallet.address));
     console.log(`ロボットのガス代残高: ${ethers.formatEther(bal)} ETH`);
     return;
   }
 
-  await notify(`🤖 AutoA ロボットを起動しました（金庫 ${vaults.length} 個）。\n${await describeAll()}`);
+  await notify(`🤖 AutoA ロボットを起動しました（金庫 ${vaults.length} 個）。\n${await describeAll({ withResult: true })}`);
 
   let lastReport = Date.now();
+  // 日本時間の日付（例 2026-10-22）。決まった時刻に1日1回送るために使う
+  const jstDay = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  const jstHour = () => new Date(Date.now() + 9 * 3600e3).getUTCHours();
+  const fixedHour = /^\d{1,2}$/.test(cfg.reportHourJst) ? Number(cfg.reportHourJst) : null;
+  // 起動したのが報告時刻より後なら、今日の分は送ったことにする（再起動のたびに送らないため）
+  if (fixedHour !== null && jstHour() >= fixedHour) state.lastReportDay = state.lastReportDay || jstDay();
   let lastLowGasWarn = 0;
   const errors = new Map(); // 金庫ごとの連続エラー回数
 
@@ -230,6 +339,23 @@ async function main() {
       if (pid !== 0n && !paused) {
         const rc = await send(v, "collectFees");
         const toOwner = await read(() => v.vault.feesToOwner());
+        if (toOwner) {
+          // 財布へ送った手数料を ETH に換算して記録（金庫から出ていった分も成績に含めるため）
+          try {
+            const slot = await read(() => v.pool.slot0());
+            const sqrtP = Number(slot.sqrtPriceX96) / 2 ** 96;
+            for (const lg of rc.logs) {
+              if (lg.address.toLowerCase() !== v.addr.toLowerCase()) continue;
+              const ev = v.vault.interface.parseLog(lg);
+              if (ev?.name !== "FeesCollected") continue;
+              const k = v.addr.toLowerCase();
+              state.sentToOwnerEth[k] = (state.sentToOwnerEth[k] || 0) + toEth(v, Number(ev.args[0]), Number(ev.args[1]), sqrtP);
+              saveState(state);
+            }
+          } catch (e) {
+            log(`[${v.name}] 手数料の記録に失敗:`, shortErr(e));
+          }
+        }
         await notify(`💰 [${v.name}] 手数料を回収しました（${toOwner ? "持ち主の財布へ送金" : "金庫に保管"}）。\n${EXPLORER}${rc.hash}`);
       }
     }
@@ -258,9 +384,14 @@ async function main() {
       }
     }
 
-    if (cfg.reportHours > 0 && Date.now() - lastReport > cfg.reportHours * 3600e3) {
+    const due =
+      fixedHour !== null
+        ? jstHour() >= fixedHour && state.lastReportDay !== jstDay()
+        : cfg.reportHours > 0 && Date.now() - lastReport > cfg.reportHours * 3600e3;
+    if (due) {
       lastReport = Date.now();
-      await notify(`📊 定期報告\n${await describeAll()}\nガス代残高: ${ethers.formatEther(bal)} ETH`);
+      state.lastReportDay = jstDay();
+      await notify(`📊 定期報告（${jstDay()}）\n${await describeAll({ withResult: true, save: true })}\nガス代残高: ${ethers.formatEther(bal)} ETH`);
     }
   }
 
@@ -275,7 +406,10 @@ async function main() {
   }
 }
 
-main().catch(async (e) => {
-  await notify(`🛑 AutoA ロボットが停止しました: ${shortErr(e)}`);
-  process.exit(1);
-});
+// 直接実行されたときだけ動かす（計算部分を試験で読み込めるようにするため）
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(async (e) => {
+    await notify(`🛑 AutoA ロボットが停止しました: ${shortErr(e)}`);
+    process.exit(1);
+  });
+}

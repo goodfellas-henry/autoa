@@ -8,6 +8,8 @@
 #   金庫:    bash setup.sh 0x金庫1の住所 0x金庫2の住所
 #            → 金庫の住所を登録し、ロボットを24時間動かし始めます
 #              （金庫を増やすときも、全部の住所を並べてもう一度実行）
+#   成績:    bash setup.sh start 0.01 0.01
+#            → 各金庫に入れた ETH の量を登録し、毎朝の定期報告に成績を載せます
 # =====================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -54,6 +56,22 @@ if [ "$1" = "discord" ]; then
   curl -fsS -H "content-type: application/json" -d '{"username":"AutoA","content":"✅ AutoA の通知テストです。これが見えていれば設定完了です。"}' "$URL" >/dev/null \
     && echo "Discord にテスト通知を送りました。届いているか確認してください。" \
     || echo "テスト通知が送れませんでした。URLをもう一度確認してください。"
+  restart_if_running
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 入れた ETH の量（成績の比べる相手）
+if [ "$1" = "start" ]; then
+  shift
+  [ $# -ge 1 ] || { echo "使い方: bash setup.sh start 0.01 0.01 （金庫を登録した順に、入れた ETH の量を並べる）"; exit 1; }
+  for N in "$@"; do
+    [[ "$N" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "数字の形が正しくありません: $N（例 0.01）"; exit 1; }
+  done
+  LIST="$(IFS=,; echo "$*")"
+  if grep -q '^START_ETH=' .env; then sed -i "s|^START_ETH=.*|START_ETH=$LIST|" .env; else echo "START_ETH=$LIST" >> .env; fi
+  grep -q '^REPORT_HOUR_JST=' .env || echo "REPORT_HOUR_JST=9" >> .env
+  chmod 600 .env
+  echo "入れた ETH の量を登録しました: $LIST"
   restart_if_running
   exit 0
 fi
