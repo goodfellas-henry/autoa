@@ -16,6 +16,13 @@ say() {
     -d "$(printf '{"username":"AutoA","content":"%s"}' "$1")" "$WEBHOOK" >/dev/null 2>&1 || true
 }
 
+# 夜の間（既定 23時〜8時、日本時間）は更新しない（夜中にお知らせが来ないように）
+QUIET="$(grep -E '^QUIET_HOURS_JST=' bot/.env 2>/dev/null | cut -d= -f2-)"; QUIET="${QUIET:-23-8}"
+if [[ "$QUIET" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+  F=$((10#${BASH_REMATCH[1]})); T=$((10#${BASH_REMATCH[2]})); H=$((10#$(TZ=Asia/Tokyo date +%H)))
+  if { [ $F -lt $T ] && [ $H -ge $F ] && [ $H -lt $T ]; } || { [ $F -gt $T ] && { [ $H -ge $F ] || [ $H -lt $T ]; }; }; then exit 0; fi
+fi
+
 git fetch -q origin main || exit 0
 OLD="$(git rev-parse HEAD)"
 NEW="$(git rev-parse origin/main)"

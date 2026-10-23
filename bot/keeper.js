@@ -102,7 +102,50 @@ const now = () => new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
 const log = (...a) => console.log(`[${now()}]`, ...a);
 const niceSym = (s) => (s === "WETH" ? "ETH" : s === "cbBTC" ? "BTC" : s);
 
-async function notify(text) {
+// ---------------------------------------------------------------- 夜間はお知らせを控える
+// 夜の間（既定 23時〜8時、日本時間）は急ぎでないお知らせをためておき、朝にまとめて送る。
+// 🛑 停止・❗ エラー・⛽ ガス代不足・⚠️ 注意 は急ぎなので、夜でもすぐ送る。
+const PENDING_FILE = path.join(here, "pending.json");
+const URGENT = /^(🛑|❗|⛽|⚠️)/u;
+export function quietNow() {
+  const m = String(process.env.QUIET_HOURS_JST ?? "23-8").trim().match(/^(\d{1,2})-(\d{1,2})$/);
+  if (!m) return false; // off などにすると夜も送る
+  const from = Number(m[1]), to = Number(m[2]);
+  const h = new Date(Date.now() + 9 * 3600e3).getUTCHours();
+  return from === to ? false : from < to ? h >= from && h < to : h >= from || h < to;
+}
+function loadPending() {
+  try { return JSON.parse(fs.readFileSync(PENDING_FILE, "utf8")); } catch (_) { return []; }
+}
+function savePending(list) {
+  try { fs.writeFileSync(PENDING_FILE, JSON.stringify(list)); } catch (_) {}
+}
+export async function notify(text) {
+  if (cfg.discord && !URGENT.test(text) && quietNow()) {
+    log("（夜間のため朝にまとめて送ります）", text);
+    const list = loadPending();
+    list.push({ at: now(), text });
+    savePending(list.slice(-50));
+    return;
+  }
+  await post(text);
+}
+// 夜が明けたら、ためておいたお知らせをまとめて送る
+export async function flushPending() {
+  if (quietNow()) return;
+  const list = loadPending();
+  if (!list.length) return;
+  savePending([]);
+  let buf = `🌙 夜の間のお知らせ（${list.length}件）`;
+  for (const p of list) {
+    const piece = `\n\n[${p.at}]\n${p.text}`;
+    if (buf.length + piece.length > 1800) { await post(buf); buf = "🌙 夜の間のお知らせ（続き）"; }
+    buf += piece;
+  }
+  await post(buf);
+}
+
+async function post(text) {
   log(text);
   if (!cfg.discord) return;
   try {
@@ -310,6 +353,10 @@ async function main() {
   const fixedHour = /^\d{1,2}$/.test(cfg.reportHourJst) ? Number(cfg.reportHourJst) : null;
   // 起動したのが報告時刻より後なら、今日の分は送ったことにする（再起動のたびに送らないため）
   if (fixedHour !== null && jstHour() >= fixedHour) state.lastReportDay = state.lastReportDay || jstDay();
+  state.lastCollectDay ||= {};
+  if (fixedHour !== null && jstHour() >= fixedHour) {
+    for (const v of vaults) state.lastCollectDay[v.addr.toLowerCase()] ||= jstDay();
+  }
   let lastLowGasWarn = 0;
   const errors = new Map(); // 金庫ごとの連続エラー回数
 
@@ -333,8 +380,16 @@ async function main() {
         `🔁 [${v.name}] 範囲を追従させました。\n前: ${priceText(v, before.lo)}〜${priceText(v, before.hi)}\n後: ${priceText(v, after.lo)}〜${priceText(v, after.hi)}\n${v.base} の価格: ${priceText(v, after.price)}\n（交換なしで価格のすぐ隣に置き直しました。価格が少し戻ると手数料が入り始めます）\n${EXPLORER}${rc.hash}`
       );
     }
-    if (cfg.collectHours > 0 && Date.now() - v.lastCollect > cfg.collectHours * 3600e3) {
+    // 手数料の回収は、定期報告と同じ朝の時刻にまとめて行う（夜中にお知らせが来ないように）
+    const k = v.addr.toLowerCase();
+    const collectDue =
+      fixedHour !== null
+        ? cfg.collectHours > 0 && jstHour() >= fixedHour && state.lastCollectDay[k] !== jstDay()
+        : cfg.collectHours > 0 && Date.now() - v.lastCollect > cfg.collectHours * 3600e3;
+    if (collectDue) {
       v.lastCollect = Date.now();
+      state.lastCollectDay[k] = jstDay();
+      saveState(state);
       const [pid, paused] = await readAll([() => v.vault.positionId(), () => v.vault.paused()]);
       if (pid !== 0n && !paused) {
         const rc = await send(v, "collectFees");
@@ -362,6 +417,7 @@ async function main() {
   }
 
   async function round() {
+    await flushPending();
     const bal = await read(() => provider.getBalance(wallet.address));
     if (Number(ethers.formatEther(bal)) < cfg.lowGasEth && Date.now() - lastLowGasWarn > 6 * 3600e3) {
       lastLowGasWarn = Date.now();

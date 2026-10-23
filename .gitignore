@@ -2,3 +2,4 @@ node_modules/
 bot/.env
 .env
 bot/state.json
+bot/pending.json
