@@ -313,8 +313,8 @@
   // 入れた記録はこの端末（ブラウザ）に保存する。操作画面から入れたときは自動で記録する。
   const KNOWN_DEPOSITS = {
     // 設置時の記録（ブロックチェーン上の入金記録より）
-    "0x231914d76edac99528683ef909b16ab9f18f9974": { eth: 0.01, date: "2026-10-21" },
-    "0xdeeeb4b517e54a656b6b707e016372d7bfb98c18": { eth: 0.01, date: "2026-10-21" },
+    "0x231914d76edac99528683ef909b16ab9f18f9974": { eth: 0.01, date: "2026-10-21", ts: Date.parse("2026-10-20T17:01:19Z") },
+    "0xdeeeb4b517e54a656b6b707e016372d7bfb98c18": { eth: 0.01, date: "2026-10-21", ts: Date.parse("2026-10-20T17:03:17Z") },
   };
   const recKey = (addr) => `deposit:${chainId}:${addr.toLowerCase()}`;
   function loadRec(addr) {
@@ -331,14 +331,14 @@
   // 操作画面から ETH を入れたとき、量を足し上げる（円は入れた日の値段で足す）
   async function addToRec(addr, ethIn) {
     let r = loadRec(addr);
-    if (!r || !(r.eth > 0)) r = { eth: 0, date: todayJst(), yen: 0 };
+    if (!r || !(r.eth > 0)) r = { eth: 0, date: todayJst(), ts: Date.now(), yen: 0 };
     let yen = r.yen ?? null;
     if (yen == null && r.eth > 0) {
-      const h = await jpyOn(r.date);
+      const h = (await jpyAt(r.ts)) || (await jpyOn(r.date));
       yen = h ? r.eth * h : null;
     }
     const nowJ = await jpyNow();
-    saveRec(addr, { eth: r.eth + ethIn, date: r.date, yen: yen != null && nowJ ? yen + ethIn * nowJ : null });
+    saveRec(addr, { eth: r.eth + ethIn, date: r.date, ts: r.ts, yen: yen != null && nowJ ? yen + ethIn * nowJ : null });
   }
 
   // ETH の円の値段（CoinGecko（コインゲッコー）の無料の公開情報を使う）
@@ -358,6 +358,21 @@
       if (usdPerEth > 0 && fx > 0) { jpyCache = { at: Date.now(), v: usdPerEth * fx }; return jpyCache.v; }
     } catch (_) {}
     return jpyCache.v;
+  }
+  // 入れた時刻ちょうどの値段（前後1時間の値動きから一番近いものを使う）
+  async function jpyAt(ts) {
+    if (!(ts > 0)) return null;
+    const key = "jpyat:" + Math.round(ts / 60e3);
+    try { const c = Number(localStorage.getItem(key)); if (c > 0) return c; } catch (_) {}
+    try {
+      const from = Math.floor(ts / 1000) - 3600, to = Math.floor(ts / 1000) + 3600;
+      const r = await fetch(`https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range?vs_currency=jpy&from=${from}&to=${to}`);
+      const prices = (await r.json())?.prices || [];
+      let best = null;
+      for (const [t, v] of prices) if (v > 0 && (!best || Math.abs(t - ts) < Math.abs(best[0] - ts))) best = [t, v];
+      if (best) { try { localStorage.setItem(key, String(best[1])); } catch (_) {} return best[1]; }
+    } catch (_) {}
+    return null;
   }
   async function jpyOn(date) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "")) return null;
@@ -386,7 +401,7 @@
       return;
     }
     const nowJ = await jpyNow();
-    const histJ = r.yen != null ? null : await jpyOn(r.date);
+    const histJ = r.yen != null ? null : (await jpyAt(r.ts)) || (await jpyOn(r.date));
     const inYen = r.yen != null ? r.yen : histJ ? r.eth * histJ : null;
     const ethGain = totalEth - r.eth, pctEth = (ethGain / r.eth) * 100;
     set("pIn", `${amt(r.eth, 6)} ETH${inYen != null ? `<br><small>${yen(inYen)}（${r.date}）</small>` : ""}`);
