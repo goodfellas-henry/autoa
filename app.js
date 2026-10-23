@@ -309,6 +309,102 @@
     } catch (_) { return null; }
   }
 
+  // ------------------------------------------------------------ 成績（入れたお金と今のお金）
+  // 入れた記録はこの端末（ブラウザ）に保存する。操作画面から入れたときは自動で記録する。
+  const KNOWN_DEPOSITS = {
+    // 設置時の記録（ブロックチェーン上の入金記録より）
+    "0x231914d76edac99528683ef909b16ab9f18f9974": { eth: 0.01, date: "2026-10-21" },
+    "0xdeeeb4b517e54a656b6b707e016372d7bfb98c18": { eth: 0.01, date: "2026-10-21" },
+  };
+  const recKey = (addr) => `deposit:${chainId}:${addr.toLowerCase()}`;
+  function loadRec(addr) {
+    try {
+      const r = JSON.parse(localStorage.getItem(recKey(addr)) || "null");
+      if (r) return r;
+    } catch (_) {}
+    return KNOWN_DEPOSITS[addr.toLowerCase()] || null;
+  }
+  function saveRec(addr, r) {
+    try { localStorage.setItem(recKey(addr), JSON.stringify(r)); } catch (_) {}
+  }
+  const todayJst = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+  // 操作画面から ETH を入れたとき、量を足し上げる（円は入れた日の値段で足す）
+  async function addToRec(addr, ethIn) {
+    let r = loadRec(addr);
+    if (!r || !(r.eth > 0)) r = { eth: 0, date: todayJst(), yen: 0 };
+    let yen = r.yen ?? null;
+    if (yen == null && r.eth > 0) {
+      const h = await jpyOn(r.date);
+      yen = h ? r.eth * h : null;
+    }
+    const nowJ = await jpyNow();
+    saveRec(addr, { eth: r.eth + ethIn, date: r.date, yen: yen != null && nowJ ? yen + ethIn * nowJ : null });
+  }
+
+  // ETH の円の値段（CoinGecko（コインゲッコー）の無料の公開情報を使う）
+  let jpyCache = { at: 0, v: null };
+  async function jpyNow() {
+    if (Date.now() - jpyCache.at < 60e3 && jpyCache.v) return jpyCache.v;
+    try {
+      const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=jpy");
+      const v = (await r.json())?.ethereum?.jpy;
+      if (v > 0) { jpyCache = { at: Date.now(), v }; return v; }
+    } catch (_) {}
+    // 予備：ETH のドルの値段 × ドル円（為替の無料公開情報）
+    try {
+      const usdPerEth = info?.quoteIsUsd ? info.lastPrice : await ethUsd();
+      const r = await fetch("https://open.er-api.com/v6/latest/USD");
+      const fx = (await r.json())?.rates?.JPY;
+      if (usdPerEth > 0 && fx > 0) { jpyCache = { at: Date.now(), v: usdPerEth * fx }; return jpyCache.v; }
+    } catch (_) {}
+    return jpyCache.v;
+  }
+  async function jpyOn(date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "")) return null;
+    const key = "jpyhist:" + date;
+    try { const c = Number(localStorage.getItem(key)); if (c > 0) return c; } catch (_) {}
+    try {
+      const [y, m, d] = date.split("-");
+      const r = await fetch(`https://api.coingecko.com/api/v3/coins/ethereum/history?date=${d}-${m}-${y}&localization=false`);
+      const v = (await r.json())?.market_data?.current_price?.jpy;
+      if (v > 0) { try { localStorage.setItem(key, String(v)); } catch (_) {} return v; }
+    } catch (_) {}
+    return null;
+  }
+  const yen = (n) => (n < 0 ? "−" : "") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
+  const signedYen = (n) => (n >= 0 ? "+" : "−") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
+
+  async function showPerf(totalEth) {
+    const r = loadRec(info.addr);
+    const set = (id, html) => ($(id).innerHTML = html);
+    $("pEth").value = r?.eth ?? "";
+    $("pDate").value = r?.date ?? "";
+    $("pYen").value = r?.yen != null ? Math.round(r.yen) : "";
+    if (!r || !(r.eth > 0)) {
+      set("pIn", "-"); set("pNow", `${amt(totalEth, 6)} ETH`); set("pGain", "-");
+      set("pNote", "入れた記録がありません。下の「入れた記録を直す」で、入れた ETH の量と日付を入れてください。");
+      return;
+    }
+    const nowJ = await jpyNow();
+    const histJ = r.yen != null ? null : await jpyOn(r.date);
+    const inYen = r.yen != null ? r.yen : histJ ? r.eth * histJ : null;
+    const ethGain = totalEth - r.eth, pctEth = (ethGain / r.eth) * 100;
+    set("pIn", `${amt(r.eth, 6)} ETH${inYen != null ? `<br><small>${yen(inYen)}（${r.date}）</small>` : ""}`);
+    set("pNow", `${amt(totalEth, 6)} ETH${nowJ ? `<br><small>${yen(totalEth * nowJ)}（今の値段）</small>` : ""}`);
+    if (nowJ && inYen != null) {
+      const g = totalEth * nowJ - inYen, pct = (g / inYen) * 100;
+      set("pGain", `<span class="${g >= 0 ? "up" : "down"}">${signedYen(g)}（${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%）</span>`);
+      const opYen = ethGain * nowJ, priceYen = g - opYen;
+      set("pNote",
+        `内訳：運用の成果 <b class="${opYen >= 0 ? "up" : "down"}">${signedYen(opYen)}</b>（ETH の量で ${ethGain >= 0 ? "+" : ""}${pctEth.toFixed(2)}%）` +
+        ` ／ ETH の値動き <b class="${priceYen >= 0 ? "up" : "down"}">${signedYen(priceYen)}</b><br>` +
+        `「運用の成果」は、ETH をそのまま持っていた場合と比べてどれだけ増えたかです。財布に届いた手数料（毎日数円）は含みません。`);
+    } else {
+      set("pGain", `<span class="${ethGain >= 0 ? "up" : "down"}">${ethGain >= 0 ? "+" : ""}${amt(ethGain, 6)} ETH（${pctEth >= 0 ? "+" : ""}${pctEth.toFixed(2)}%）</span>`);
+      set("pNote", "円の値段を取得できなかったため、ETH の量だけで表示しています。少し待ってから「最新の状態に更新」を押してください。");
+    }
+  }
+
   // ------------------------------------------------------------ 状況の表示
   async function refresh() {
     const [slot, pid, lo, hi, keeper, paused, feesToOwner, width, interval, twap, b0raw, b1raw, ethRaw] = await Promise.all([
@@ -356,6 +452,10 @@
       if (eu) totalText += `（約 ${usd(totalQ * eu)}）`;
     }
     $("sTotal").textContent = totalText;
+    // 金庫の中身を ETH の量に直す（ドルとの組み合わせはドル÷ETH の価格、仮想通貨どうしは元々 ETH 建て）
+    const totalEth = info.quoteIsUsd ? totalQ / price : totalQ;
+    info.lastPrice = price;
+    showPerf(totalEth).catch(() => {});
 
     const pill = $("pill");
     if (!has) {
@@ -424,19 +524,23 @@
     const v = readEth("startAmt"); if (!v) return;
     await refresh();
     const minOut = await minOutFor(Number(v));
-    await run("運用の開始", () => vault.start(5000, minOut, { value: ethers.parseEther(v) }));
+    const rc = await run("運用の開始", () => vault.start(5000, minOut, { value: ethers.parseEther(v) }));
+    if (rc) { await addToRec(info.addr, Number(v)); await refresh().catch(() => {}); }
   }
 
   async function addFunds() {
     const v = readEth("addAmt"); if (!v) return;
     await refresh();
     const minOut = await minOutFor(Number(v));
-    await run("資金の追加", () => vault.addFunds(5000, minOut, { value: ethers.parseEther(v) }));
+    const rc = await run("資金の追加", () => vault.addFunds(5000, minOut, { value: ethers.parseEther(v) }));
+    if (rc) { await addToRec(info.addr, Number(v)); await refresh().catch(() => {}); }
   }
 
   async function exitAll() {
     if (!confirm("運用を止めて、中身をすべてあなたの財布へ送ります。よろしいですか？")) return;
-    await run("全額の引き出し", () => vault.exit($("unwrap").checked));
+    const rc = await run("全額の引き出し", () => vault.exit($("unwrap").checked));
+    // 全部引き出したら記録を0に戻す（次に入れたときに新しく数え直すため）
+    if (rc) { saveRec(info.addr, { eth: 0, date: todayJst(), yen: 0 }); await refresh().catch(() => {}); }
   }
 
   async function saveParams() {
@@ -473,6 +577,16 @@
   on("newPair", updateFeeChoices, "change");
   on("btnDeploy", deploy);
   on("btnRefresh", refresh);
+  on("btnSaveRec", async () => {
+    const eth = Number($("pEth").value.replace(/,/g, ""));
+    const date = $("pDate").value;
+    const y = $("pYen").value.replace(/[,円\s]/g, "");
+    if (!(eth > 0)) return say("入れた ETH の量を数字で入れてください（例 0.01）。", "err");
+    if (!date) return say("入れた日を選んでください。", "err");
+    saveRec(info.addr, { eth, date, yen: y ? Number(y) : null });
+    say("入れた記録を保存しました。", "ok");
+    await refresh();
+  });
   on("btnStart", start);
   on("btnAdd", addFunds);
   on("btnCollect", () => run("手数料の回収", () => vault.collectFees()));

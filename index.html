@@ -34,6 +34,10 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .mono{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;word-break:break-all}
 details summary{cursor:pointer;font-weight:600;padding:4px 0}
 .hidden{display:none}
+.perf{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0 12px}
+.perf-title{font-size:13px;font-weight:700;color:var(--sub);letter-spacing:.05em}
+.perf .v.big{font-size:18px}
+.up{color:var(--good)}.down{color:var(--bad)}
 #bar{position:relative;height:34px;margin:14px 0 4px;background:var(--line);border-radius:6px}
 #barRange{position:absolute;top:0;bottom:0;background:var(--good-soft);border:2px solid var(--good);border-radius:6px}
 #barNow{position:absolute;top:-6px;bottom:-6px;width:3px;background:var(--accent);border-radius:2px}
@@ -97,6 +101,23 @@ details summary{cursor:pointer;font-weight:600;padding:4px 0}
     <div id="barWrap" class="hidden">
       <div id="bar"><div id="barRange"></div><div id="barNow"></div></div>
       <div class="barlbl"><span id="barMin"></span><span id="barMax"></span></div>
+    </div>
+    <div id="perf" class="perf">
+      <div class="perf-title">成績</div>
+      <div class="row"><span class="k">入れたお金</span><span class="v" id="pIn">-</span></div>
+      <div class="row"><span class="k">今のお金</span><span class="v" id="pNow">-</span></div>
+      <div class="row"><span class="k">増えた金額</span><span class="v big" id="pGain">-</span></div>
+      <div class="note" id="pNote"></div>
+      <details id="pEdit">
+        <summary>入れた記録を直す</summary>
+        <label for="pEth">入れた ETH の量（合計）</label>
+        <input id="pEth" inputmode="decimal" placeholder="例 0.01">
+        <label for="pDate">入れた日</label>
+        <input id="pDate" type="date">
+        <label for="pYen">入れたお金（円）<span class="note">空欄なら、入れた日の ETH の値段から自動で計算します</span></label>
+        <input id="pYen" inputmode="numeric" placeholder="例 37000">
+        <button class="sec" id="btnSaveRec">記録を保存</button>
+      </details>
     </div>
     <div class="row"><span class="k" id="sPriceLbl">価格</span><span class="v" id="sPrice">-</span></div>
     <div class="row"><span class="k">運用している範囲</span><span class="v" id="sRange">-</span></div>
