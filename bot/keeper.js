@@ -107,6 +107,7 @@ const niceSym = (s) => (s === "WETH" ? "ETH" : s === "cbBTC" ? "BTC" : s);
 // 🛑 停止・❗ エラー・⛽ ガス代不足・⚠️ 注意 は急ぎなので、夜でもすぐ送る。
 const PENDING_FILE = path.join(here, "pending.json");
 const URGENT = /^(🛑|❗|⛽|⚠️)/u;
+const headOf = (p) => (typeof p === "string" ? p : p.content || p.embeds?.[0]?.title || "");
 export function quietNow() {
   const m = String(process.env.QUIET_HOURS_JST ?? "23-8").trim().match(/^(\d{1,2})-(\d{1,2})$/);
   if (!m) return false; // off などにすると夜も送る
@@ -120,40 +121,45 @@ function loadPending() {
 function savePending(list) {
   try { fs.writeFileSync(PENDING_FILE, JSON.stringify(list)); } catch (_) {}
 }
-export async function notify(text) {
-  if (cfg.discord && !URGENT.test(text) && quietNow()) {
-    log("（夜間のため朝にまとめて送ります）", text);
+// 文字（string）か、Discord のカード（{ content, embeds }）を送る
+export async function notify(payload) {
+  if (cfg.discord && !URGENT.test(headOf(payload)) && quietNow()) {
+    log("（夜間のため朝にまとめて送ります）", headOf(payload));
     const list = loadPending();
-    list.push({ at: now(), text });
-    savePending(list.slice(-50));
+    list.push({ at: new Date().toISOString(), payload });
+    savePending(list.slice(-30));
     return;
   }
-  await post(text);
+  await post(payload);
 }
-// 夜が明けたら、ためておいたお知らせをまとめて送る
+// 文字のお知らせをカードに直す（夜のまとめ用）
+const asEmbeds = (p, at) =>
+  typeof p === "string"
+    ? [{ description: p.slice(0, 4000), color: COLOR.gray, timestamp: at }]
+    : [...(p.content ? [{ description: p.content, color: COLOR.gray, timestamp: at }] : []), ...(p.embeds || []).map((e) => ({ ...e, timestamp: e.timestamp || at }))];
+// 夜が明けたら、ためておいたお知らせを1通にまとめて送る（カードは1通に10枚まで）
 export async function flushPending() {
   if (quietNow()) return;
   const list = loadPending();
   if (!list.length) return;
   savePending([]);
-  let buf = `🌙 夜の間のお知らせ（${list.length}件）`;
-  for (const p of list) {
-    const piece = `\n\n[${p.at}]\n${p.text}`;
-    if (buf.length + piece.length > 1800) { await post(buf); buf = "🌙 夜の間のお知らせ（続き）"; }
-    buf += piece;
+  const embeds = list.flatMap((x) => asEmbeds(x.payload ?? x.text, x.at));
+  for (let i = 0; i < embeds.length; i += 10) {
+    await post({ content: i === 0 ? `🌙 **夜の間のお知らせ**（${list.length}件）` : "", embeds: embeds.slice(i, i + 10) });
   }
-  await post(buf);
 }
 
-async function post(text) {
-  log(text);
+async function post(payload) {
+  const body = typeof payload === "string" ? { content: payload.slice(0, 1900) } : payload;
+  log(headOf(payload), body.embeds ? `（カード ${body.embeds.length} 枚）` : "");
   if (!cfg.discord) return;
   try {
-    await fetch(cfg.discord, {
+    const r = await fetch(cfg.discord, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "AutoA", content: text.slice(0, 1900) }),
+      body: JSON.stringify({ username: "AutoA", ...body }),
     });
+    if (!r.ok) log("Discord 通知に失敗:", r.status, (await r.text()).slice(0, 200));
   } catch (e) {
     log("Discord 通知に失敗:", e.message);
   }
@@ -301,53 +307,96 @@ async function jpyAt(st, ts) {
 const yenText = (n) => (n < 0 ? "−" : "") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
 const signedYen = (n) => (n >= 0 ? "+" : "−") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
 const mark = (x, eps) => (x > eps ? "🟢" : x < -eps ? "🔴" : "⚪");
-const pctText = (p) => `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
+const pctText = (p) => `${p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(2)}%`;
 
-// 1つの金庫の成績の行を作る。sum には全金庫の合計を足し込む
-export async function resultText(v, totalEth, st, startEnv, nowJ, sum) {
+const COLOR = { good: 0x2ecc71, bad: 0xe5534b, gray: 0x5865f2, warn: 0xf0b232, info: 0x3498db };
+const NUM = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
+const mdDay = (iso) => (iso ? new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(5, 10).replace("-", "/").replace(/^0/, "") : "");
+
+// 1つの金庫の成績を数字で返す
+export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   const k = v.addr.toLowerCase();
   const dep = loadDeposits()[k] || {};
   const start = Number(dep.eth) > 0 ? Number(dep.eth) : startEnv;
   const sent = st.sentToOwnerEth?.[k] || 0;
   const all = totalEth + sent;
-  const lines = [];
-  let inYen = null;
-  if (start > 0 && nowJ) {
-    inYen = Number(dep.jpy) > 0 ? Number(dep.jpy) : null;
-    if (inYen == null) {
-      const h = await jpyAt(st, Date.parse(dep.at || ""));
-      if (h) inYen = start * h;
-    }
-  }
+  const r = { all, start, sent, day: mdDay(dep.at), nowJ };
   if (start > 0) {
-    const ethGain = all - start, pctEth = (ethGain / start) * 100;
-    if (inYen != null) {
-      const nowYen = all * nowJ, g = nowYen - inYen, pct = (g / inYen) * 100;
-      const opYen = ethGain * nowJ, priceYen = g - opYen;
-      const day = dep.at ? new Date(Date.parse(dep.at) + 9 * 3600e3).toISOString().slice(5, 10).replace("-", "/") : "";
-      lines.push(`　入れたお金: ${start} ETH（${yenText(inYen)}${day ? "・" + day : ""}）`);
-      lines.push(`　今のお金: ${all.toFixed(6)} ETH（${yenText(nowYen)}）`);
-      lines.push(`　増えた金額: ${mark(pct, 0.05)} ${signedYen(g)}（${pctText(pct)}）`);
-      lines.push(`　　内訳: 運用の成果 ${mark(pctEth, 0.05)} ${signedYen(opYen)}（ETH の量で ${pctText(pctEth)}）／ ETH の値動き ${mark(priceYen, 0.5)} ${signedYen(priceYen)}`);
-      sum.inYen += inYen; sum.nowYen += nowYen; sum.opYen += opYen; sum.count++;
-    } else {
-      lines.push(`　入れたお金: ${start} ETH ／ 今のお金: ${all.toFixed(6)} ETH`);
-      lines.push(`　増えた量: ${mark(pctEth, 0.05)} ${pctText(pctEth)}（${ethGain >= 0 ? "+" : ""}${ethGain.toFixed(6)} ETH）${nowJ ? "" : "（円の値段を取得できませんでした）"}`);
+    r.ethGain = all - start;
+    r.pctEth = (r.ethGain / start) * 100;
+    if (nowJ) {
+      r.inYen = Number(dep.jpy) > 0 ? Number(dep.jpy) : null;
+      if (r.inYen == null) {
+        const h = await jpyAt(st, Date.parse(dep.at || ""));
+        if (h) r.inYen = start * h;
+      }
+      if (r.inYen != null) {
+        r.nowYen = all * nowJ;
+        r.gain = r.nowYen - r.inYen;
+        r.pct = (r.gain / r.inYen) * 100;
+        r.opYen = r.ethGain * nowJ;
+        r.priceYen = r.gain - r.opYen;
+      }
     }
-  } else {
-    lines.push(`　ETH 換算の合計: ${all.toFixed(6)} ETH`);
   }
-  if (sent > 0) lines.push(`　（今のお金には、財布へ送った手数料 ${sent.toFixed(6)} ETH を含みます）`);
   const prev = st.lastTotal?.[k];
   if (typeof prev === "number" && prev > 0) {
-    const d = ((all - prev) / prev) * 100;
-    lines.push(`　前回の報告から: ETH の量で ${pctText(d)}${nowJ ? `（${signedYen((all - prev) * nowJ)}）` : ""}`);
+    r.prevPct = ((all - prev) / prev) * 100;
+    if (nowJ) r.prevYen = (all - prev) * nowJ;
   }
-  return { line: lines.join("\n"), all };
+  return r;
+}
+
+// 全体のまとめのカード
+export function summaryEmbed(title, list) {
+  const ok = list.filter((x) => x.p?.gain != null);
+  if (!ok.length) {
+    return { title, color: COLOR.gray, description: list.map((x) => `金庫${x.no} ${x.p ? `${x.p.all.toFixed(6)} ETH` : "計算できませんでした"}`).join("\n") + "\n（円の値段を取得できませんでした）" };
+  }
+  const sum = (f) => ok.reduce((a, x) => a + (x.p[f] || 0), 0);
+  const inY = sum("inYen"), nowY = sum("nowYen"), g = nowY - inY, pct = (g / inY) * 100, op = sum("opYen"), pr = sum("priceYen");
+  const lines = [
+    `**今のお金　${yenText(nowY)}**`,
+    `入れたお金　${yenText(inY)}`,
+    "",
+    `**増えた金額　${mark(g, 0.5)} ${signedYen(g)}**（${pctText(pct)}）`,
+    `├ 運用の成果　${mark(op, 0.5)} ${signedYen(op)}`,
+    `└ ETH の値動き　${mark(pr, 0.5)} ${signedYen(pr)}`,
+  ];
+  const withPrev = ok.filter((x) => x.p.prevYen != null);
+  if (withPrev.length) {
+    const d = withPrev.reduce((a, x) => a + x.p.prevYen, 0);
+    lines.push("", `前回の報告から　${mark(d, 0.5)} ${signedYen(d)}`);
+  }
+  return { title, color: g >= 0 ? COLOR.good : COLOR.bad, description: lines.join("\n") };
+}
+
+// 金庫ごとのカード
+export function vaultEmbed(x) {
+  const { v, no, s, p } = x;
+  const state = s.pid === 0n ? "⏸ 運用していません" : s.paused ? "⏸ 一時停止中" : s.inRange ? "✅ 範囲内" : "⚠️ 範囲外";
+  const lines = [];
+  if (p?.gain != null) {
+    lines.push(`今のお金 **${yenText(p.nowYen)}**（入れたお金 ${yenText(p.inYen)}）`);
+    lines.push(`増えた金額 ${mark(p.gain, 0.5)} ${signedYen(p.gain)}（${pctText(p.pct)}）`);
+    lines.push(`運用の成果 ${mark(p.opYen, 0.5)} ${signedYen(p.opYen)}（ETH の量で ${pctText(p.pctEth)}）`);
+    if (p.prevYen != null) lines.push(`前回の報告から ${mark(p.prevYen, 0.5)} ${signedYen(p.prevYen)}`);
+  } else if (p?.start > 0) {
+    lines.push(`今 **${p.all.toFixed(6)} ETH**（入れた ${p.start} ETH）`);
+    lines.push(`増えた量 ${mark(p.pctEth, 0.05)} ${pctText(p.pctEth)}`);
+  } else if (p) {
+    lines.push(`今 **${p.all.toFixed(6)} ETH**`);
+  } else {
+    lines.push("成績を計算できませんでした");
+  }
+  if (s.pid !== 0n) lines.push(`${v.base} ${priceText(v, s.price)}（範囲 ${priceText(v, s.lo)}〜${priceText(v, s.hi)}）`);
+  const color = s.pid === 0n || s.paused ? COLOR.gray : !s.inRange ? COLOR.warn : p?.gain != null ? (p.gain >= 0 ? COLOR.good : COLOR.bad) : COLOR.info;
+  return { title: `金庫${no} ${v.name.replace("/", " / ")}　${state}`, color, description: lines.join("\n") };
 }
 
 function priceText(v, n) {
-  return v.quoteIsUsd ? `$${fmt(n)}` : `${fmt(n)} ${v.quote}`;
+  const t = n >= 100 ? n.toLocaleString("en-US", { maximumFractionDigits: 0 }) : fmt(n);
+  return v.quoteIsUsd ? `$${t}` : `${t} ${v.quote}`;
 }
 
 function describe(v, s) {
@@ -385,38 +434,43 @@ async function main() {
   state.sentToOwnerEth ||= {};
   state.lastTotal ||= {};
 
-  // withResult: 成績（ETH 換算）も付ける。save: 「前回の報告」として記録する
-  const describeAll = async ({ withResult = false, save = false } = {}) => {
-    const lines = [];
-    const nowJ = withResult ? await jpyNow() : null;
-    const sum = { inYen: 0, nowYen: 0, opYen: 0, count: 0 };
+  // 全金庫の状態と成績を集める。save: 「前回の報告」として記録する
+  const gather = async ({ save = false } = {}) => {
+    const nowJ = await jpyNow();
+    const list = [];
     for (const [i, v] of vaults.entries()) {
-      lines.push(describe(v, await snapshot(v)));
-      if (!withResult) continue;
+      const s = await snapshot(v);
+      let p = null;
       try {
-        const { line, all } = await resultText(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0, nowJ, sum);
-        lines.push(line);
-        if (save) state.lastTotal[v.addr.toLowerCase()] = all;
+        p = await perfOf(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0, nowJ);
+        if (save) state.lastTotal[v.addr.toLowerCase()] = p.all;
       } catch (e) {
-        lines.push(`　（成績の計算に失敗しました: ${shortErr(e)}）`);
+        log(`[${v.name}] 成績の計算に失敗:`, shortErr(e));
       }
-    }
-    if (sum.count >= 2) {
-      const g = sum.nowYen - sum.inYen, pct = (g / sum.inYen) * 100;
-      lines.push(`【全部の合計】入れたお金 ${yenText(sum.inYen)} → 今 ${yenText(sum.nowYen)}：${mark(pct, 0.05)} ${signedYen(g)}（${pctText(pct)}）／ うち運用の成果 ${mark(sum.opYen, 0.5)} ${signedYen(sum.opYen)}`);
+      list.push({ v, no: NUM[i] || `${i + 1}`, s, p });
     }
     if (save) saveState(state);
-    return lines.join("\n");
+    return list;
   };
+  const footer = (bal) => ({ text: `ガス代残高 ${Number(ethers.formatEther(bal)).toFixed(5)} ETH ・ 今のお金には財布へ送った手数料も含みます` });
 
   if (process.argv.includes("--status")) {
-    console.log(await describeAll({ withResult: true }));
+    for (const x of await gather()) {
+      const e = vaultEmbed(x);
+      console.log(`${e.title}\n${e.description.replace(/\*\*/g, "")}\n`);
+    }
     const bal = await read(() => provider.getBalance(wallet.address));
     console.log(`ロボットのガス代残高: ${ethers.formatEther(bal)} ETH`);
     return;
   }
 
-  await notify(`🤖 AutoA ロボットを起動しました（金庫 ${vaults.length} 個）。\n${await describeAll({ withResult: true })}`);
+  {
+    const list = await gather();
+    const bal = await read(() => provider.getBalance(wallet.address));
+    const sum = summaryEmbed("今の成績", list);
+    sum.footer = footer(bal);
+    await notify({ content: `🤖 ロボットを起動しました（金庫 ${vaults.length} 個）`, embeds: [sum] });
+  }
 
   let lastReport = Date.now();
   // 日本時間の日付（例 2026-10-22）。決まった時刻に1日1回送るために使う
@@ -448,9 +502,20 @@ async function main() {
       const before = await snapshot(v);
       const rc = await send(v, "rebalance");
       const after = await snapshot(v);
-      await notify(
-        `🔁 [${v.name}] 範囲を追従させました。\n前: ${priceText(v, before.lo)}〜${priceText(v, before.hi)}\n後: ${priceText(v, after.lo)}〜${priceText(v, after.hi)}\n${v.base} の価格: ${priceText(v, after.price)}\n（交換なしで価格のすぐ隣に置き直しました。価格が少し戻ると手数料が入り始めます）\n${EXPLORER}${rc.hash}`
-      );
+      const no = NUM[vaults.indexOf(v)] || "";
+      await notify({
+        embeds: [{
+          title: `🔁 金庫${no} ${v.name.replace("/", " / ")} の範囲を置き直しました`,
+          color: COLOR.info,
+          description: [
+            `${v.base} の値段 **${priceText(v, after.price)}** が範囲の外に出たため、すぐ隣に置き直しました。`,
+            `前　${priceText(v, before.lo)}〜${priceText(v, before.hi)}`,
+            `後　${priceText(v, after.lo)}〜${priceText(v, after.hi)}`,
+            `値段が少し戻ると、また手数料が入り始めます。[取引の記録](${EXPLORER}${rc.hash})`,
+          ].join("\n"),
+          timestamp: new Date().toISOString(),
+        }],
+      });
     }
     // 手数料の回収は、定期報告と同じ朝の時刻にまとめて行う（夜中にお知らせが来ないように）
     const k = v.addr.toLowerCase();
@@ -483,13 +548,15 @@ async function main() {
             log(`[${v.name}] 手数料の記録に失敗:`, shortErr(e));
           }
         }
-        await notify(`💰 [${v.name}] 手数料を回収しました（${toOwner ? "持ち主の財布へ送金" : "金庫に保管"}）。\n${EXPLORER}${rc.hash}`);
+        collected.push(`金庫${NUM[vaults.indexOf(v)] || ""} ${v.name.replace("/", " / ")} → ${toOwner ? "財布へ送りました" : "金庫に保管しました"}（[記録](${EXPLORER}${rc.hash})）`);
       }
     }
   }
 
+  let collected = [];
   async function round() {
     await flushPending();
+    collected = [];
     const bal = await read(() => provider.getBalance(wallet.address));
     if (Number(ethers.formatEther(bal)) < cfg.lowGasEth && Date.now() - lastLowGasWarn > 6 * 3600e3) {
       lastLowGasWarn = Date.now();
@@ -512,6 +579,10 @@ async function main() {
       }
     }
 
+    if (collected.length) {
+      await notify({ embeds: [{ title: "💰 手数料を回収しました", color: COLOR.info, description: collected.join("\n"), timestamp: new Date().toISOString() }] });
+    }
+
     const due =
       fixedHour !== null
         ? jstHour() >= fixedHour && state.lastReportDay !== jstDay()
@@ -519,7 +590,11 @@ async function main() {
     if (due) {
       lastReport = Date.now();
       state.lastReportDay = jstDay();
-      await notify(`📊 定期報告（${jstDay()}）\n${await describeAll({ withResult: true, save: true })}\nガス代残高: ${ethers.formatEther(bal)} ETH`);
+      const list = await gather({ save: true });
+      const [, m, d] = jstDay().split("-");
+      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list), ...list.map(vaultEmbed)];
+      embeds[embeds.length - 1].footer = footer(bal);
+      await notify({ embeds });
     }
   }
 
