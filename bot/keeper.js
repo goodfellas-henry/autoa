@@ -320,7 +320,7 @@ export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   const start = Number(dep.eth) > 0 ? Number(dep.eth) : startEnv;
   const sent = st.sentToOwnerEth?.[k] || 0;
   const all = totalEth + sent;
-  const r = { all, start, sent, day: mdDay(dep.at), nowJ };
+  const r = { all, start, sent, day: mdDay(dep.at), nowJ, depTs: Date.parse(dep.at || "") || null };
   if (start > 0) {
     r.ethGain = all - start;
     r.pctEth = (r.ethGain / start) * 100;
@@ -347,8 +347,59 @@ export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   return r;
 }
 
+// ---------------------------------------------------------------- 月間の成績
+// 毎朝の報告の数字を日ごとに記録しておき、月の初めと比べる
+export function recordDaily(st, day, list) {
+  st.daily ||= {};
+  const row = {};
+  for (const x of list) if (x.p) row[x.v.addr.toLowerCase()] = { all: x.p.all, yen: x.p.nowYen ?? null };
+  st.daily[day] = row;
+  const keys = Object.keys(st.daily).sort();
+  for (const k of keys.slice(0, Math.max(0, keys.length - 400))) delete st.daily[k];
+}
+// month（例 "2026-10"）が始まる直前の記録。なければ入れたときの数字を使う
+function baseOf(st, addr, month, p) {
+  const keys = Object.keys(st.daily || {}).filter((k) => k < `${month}-01`).sort();
+  for (let i = keys.length - 1; i >= 0; i--) {
+    const b = st.daily[keys[i]]?.[addr];
+    if (b) return { all: b.all, yen: b.yen };
+  }
+  return { all: p.start, yen: p.inYen ?? null };
+}
+// 1つの月の成績（全金庫の合計）。end を省くと今の数字で計算する
+export function monthStats(st, month, list, end = null) {
+  let gain = 0, op = 0, ok = 0;
+  for (const x of list) {
+    const p = x.p;
+    if (!p || !(p.start > 0) || !p.nowJ) continue;
+    const k = x.v.addr.toLowerCase();
+    // 入れたのがこの月より後なら対象外
+    if (p.depTs && new Date(p.depTs + 9 * 3600e3).toISOString().slice(0, 7) > month) continue;
+    const b = baseOf(st, k, month, p);
+    const e = end?.[k] || { all: p.all, yen: p.nowYen };
+    if (b.yen == null || e.yen == null) continue;
+    gain += e.yen - b.yen;
+    op += (e.all - b.all) * p.nowJ;
+    ok++;
+  }
+  return ok ? { gain, op } : null;
+}
+// 入れてからの「運用の成果」を1か月あたりに直した目安
+export function monthlyPace(list) {
+  let op = 0, inY = 0, days = Infinity;
+  for (const x of list) {
+    const p = x.p;
+    if (p?.opYen == null || !p.depTs) continue;
+    op += p.opYen; inY += p.inYen;
+    days = Math.min(days, (Date.now() - p.depTs) / 864e5);
+  }
+  if (!(inY > 0) || !(days >= 1)) return null;
+  const perMonth = (op / days) * 30;
+  return { perMonth, pct: (perMonth / inY) * 100, days };
+}
+
 // 全体のまとめのカード
-export function summaryEmbed(title, list) {
+export function summaryEmbed(title, list, st = null) {
   const ok = list.filter((x) => x.p?.gain != null);
   if (!ok.length) {
     return { title, color: COLOR.gray, description: list.map((x) => `金庫${x.no} ${x.p ? `${x.p.all.toFixed(6)} ETH` : "計算できませんでした"}`).join("\n") + "\n（円の値段を取得できませんでした）" };
@@ -367,6 +418,15 @@ export function summaryEmbed(title, list) {
   if (withPrev.length) {
     const d = withPrev.reduce((a, x) => a + x.p.prevYen, 0);
     lines.push("", `前回の報告から　${mark(d, 0.5)} ${signedYen(d)}`);
+  }
+  if (st) {
+    const month = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 7);
+    const ms = monthStats(st, month, list);
+    const pace = monthlyPace(list);
+    if (ms || pace) lines.push("");
+    if (ms) lines.push(`**今月（${Number(month.slice(5))}月）**　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)} ／ うち運用の成果 ${mark(ms.op, 0.5)} ${signedYen(ms.op)}`);
+    if (pace) lines.push(`**1か月あたりのペース**　運用の成果 約 ${signedYen(pace.perMonth)}（月 ${pctText(pace.pct)}）`);
+    if (pace && pace.days < 14) lines.push(`（始めて${Math.floor(pace.days)}日分からの目安です）`);
   }
   return { title, color: g >= 0 ? COLOR.good : COLOR.bad, description: lines.join("\n") };
 }
@@ -467,7 +527,7 @@ async function main() {
   {
     const list = await gather();
     const bal = await read(() => provider.getBalance(wallet.address));
-    const sum = summaryEmbed("今の成績", list);
+    const sum = summaryEmbed("今の成績", list, state);
     sum.footer = footer(bal);
     await notify({ content: `🤖 ロボットを起動しました（金庫 ${vaults.length} 個）`, embeds: [sum] });
   }
@@ -591,10 +651,32 @@ async function main() {
       lastReport = Date.now();
       state.lastReportDay = jstDay();
       const list = await gather({ save: true });
-      const [, m, d] = jstDay().split("-");
-      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list), ...list.map(vaultEmbed)];
+      const [y, m, d] = jstDay().split("-");
+      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state), ...list.map(vaultEmbed)];
       embeds[embeds.length - 1].footer = footer(bal);
       await notify({ embeds });
+      // 月の初めの報告では、先月のまとめも送る
+      if (d === "01") {
+        const prev = new Date(Date.UTC(Number(y), Number(m) - 2, 1)).toISOString().slice(0, 7);
+        const end = {};
+        for (const x of list) if (x.p) end[x.v.addr.toLowerCase()] = { all: x.p.all, yen: x.p.nowYen ?? null };
+        const ms = monthStats(state, prev, list, end);
+        if (ms) {
+          const pace = monthlyPace(list);
+          await notify({ embeds: [{
+            title: `🗓 ${Number(prev.slice(5))}月のまとめ`,
+            color: ms.gain >= 0 ? COLOR.good : COLOR.bad,
+            description: [
+              `**増えた金額　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)}**`,
+              `├ 運用の成果　${mark(ms.op, 0.5)} ${signedYen(ms.op)}`,
+              `└ ETH の値動き　${mark(ms.gain - ms.op, 0.5)} ${signedYen(ms.gain - ms.op)}`,
+              ...(pace ? ["", `入れてからの1か月あたりのペース　運用の成果 約 ${signedYen(pace.perMonth)}（月 ${pctText(pace.pct)}）`] : []),
+            ].join("\n"),
+          }] });
+        }
+      }
+      recordDaily(state, jstDay(), list);
+      saveState(state);
     }
   }
 
