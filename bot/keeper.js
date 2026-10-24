@@ -262,22 +262,88 @@ export function toEth(v, raw0, raw1, sqrtP) {
   return v.wethIs0 ? (raw0 + raw1 / p) / 1e18 : (raw1 + raw0 * p) / 1e18;
 }
 
-function resultText(v, totalEth, st, start) {
-  const sent = st.sentToOwnerEth?.[v.addr.toLowerCase()] || 0;
+// ---------------------------------------------------------------- 円での成績
+// 入れた記録（deposits.json）と、ETH の円の値段（CoinGecko（コインゲッコー）の無料公開情報）を使う
+function loadDeposits() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(here, "deposits.json"), "utf8"));
+    const out = {};
+    for (const [k, d] of Object.entries(raw)) if (/^0x/i.test(k)) out[k.toLowerCase()] = d;
+    return out;
+  } catch (_) { return {}; }
+}
+async function getJson(url) {
+  const r = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+export async function jpyNow() {
+  try {
+    const v = (await getJson("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=jpy"))?.ethereum?.jpy;
+    return v > 0 ? v : null;
+  } catch (_) { return null; }
+}
+// 入れた時刻ちょうどの ETH の円の値段（一度調べたら記録しておく）
+async function jpyAt(st, ts) {
+  if (!(ts > 0)) return null;
+  st.jpyAt ||= {};
+  const key = String(Math.round(ts / 60e3));
+  if (st.jpyAt[key] > 0) return st.jpyAt[key];
+  try {
+    const from = Math.floor(ts / 1000) - 3600, to = Math.floor(ts / 1000) + 3600;
+    const prices = (await getJson(`https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range?vs_currency=jpy&from=${from}&to=${to}`))?.prices || [];
+    let best = null;
+    for (const [t, v] of prices) if (v > 0 && (!best || Math.abs(t - ts) < Math.abs(best[0] - ts))) best = [t, v];
+    if (best) { st.jpyAt[key] = best[1]; saveState(st); return best[1]; }
+  } catch (_) {}
+  return null;
+}
+const yenText = (n) => (n < 0 ? "−" : "") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
+const signedYen = (n) => (n >= 0 ? "+" : "−") + Math.round(Math.abs(n)).toLocaleString("ja-JP") + "円";
+const mark = (x, eps) => (x > eps ? "🟢" : x < -eps ? "🔴" : "⚪");
+const pctText = (p) => `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
+
+// 1つの金庫の成績の行を作る。sum には全金庫の合計を足し込む
+export async function resultText(v, totalEth, st, startEnv, nowJ, sum) {
+  const k = v.addr.toLowerCase();
+  const dep = loadDeposits()[k] || {};
+  const start = Number(dep.eth) > 0 ? Number(dep.eth) : startEnv;
+  const sent = st.sentToOwnerEth?.[k] || 0;
   const all = totalEth + sent;
-  let line = `　ETH 換算の合計: ${all.toFixed(6)} ETH`;
-  if (sent > 0) line += `（うち財布へ送った手数料 ${sent.toFixed(6)}）`;
-  if (start > 0) {
-    const pct = ((all - start) / start) * 100;
-    const mark = pct > 0.05 ? "🟢" : pct < -0.05 ? "🔴" : "⚪";
-    line += `\n　入れた ${start} ETH と比べて: ${mark} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%（${all - start >= 0 ? "+" : ""}${(all - start).toFixed(6)} ETH）`;
+  const lines = [];
+  let inYen = null;
+  if (start > 0 && nowJ) {
+    inYen = Number(dep.jpy) > 0 ? Number(dep.jpy) : null;
+    if (inYen == null) {
+      const h = await jpyAt(st, Date.parse(dep.at || ""));
+      if (h) inYen = start * h;
+    }
   }
-  const prev = st.lastTotal?.[v.addr.toLowerCase()];
+  if (start > 0) {
+    const ethGain = all - start, pctEth = (ethGain / start) * 100;
+    if (inYen != null) {
+      const nowYen = all * nowJ, g = nowYen - inYen, pct = (g / inYen) * 100;
+      const opYen = ethGain * nowJ, priceYen = g - opYen;
+      const day = dep.at ? new Date(Date.parse(dep.at) + 9 * 3600e3).toISOString().slice(5, 10).replace("-", "/") : "";
+      lines.push(`　入れたお金: ${start} ETH（${yenText(inYen)}${day ? "・" + day : ""}）`);
+      lines.push(`　今のお金: ${all.toFixed(6)} ETH（${yenText(nowYen)}）`);
+      lines.push(`　増えた金額: ${mark(pct, 0.05)} ${signedYen(g)}（${pctText(pct)}）`);
+      lines.push(`　　内訳: 運用の成果 ${mark(pctEth, 0.05)} ${signedYen(opYen)}（ETH の量で ${pctText(pctEth)}）／ ETH の値動き ${mark(priceYen, 0.5)} ${signedYen(priceYen)}`);
+      sum.inYen += inYen; sum.nowYen += nowYen; sum.opYen += opYen; sum.count++;
+    } else {
+      lines.push(`　入れたお金: ${start} ETH ／ 今のお金: ${all.toFixed(6)} ETH`);
+      lines.push(`　増えた量: ${mark(pctEth, 0.05)} ${pctText(pctEth)}（${ethGain >= 0 ? "+" : ""}${ethGain.toFixed(6)} ETH）${nowJ ? "" : "（円の値段を取得できませんでした）"}`);
+    }
+  } else {
+    lines.push(`　ETH 換算の合計: ${all.toFixed(6)} ETH`);
+  }
+  if (sent > 0) lines.push(`　（今のお金には、財布へ送った手数料 ${sent.toFixed(6)} ETH を含みます）`);
+  const prev = st.lastTotal?.[k];
   if (typeof prev === "number" && prev > 0) {
     const d = ((all - prev) / prev) * 100;
-    line += `\n　前回の報告から: ${d >= 0 ? "+" : ""}${d.toFixed(2)}%`;
+    lines.push(`　前回の報告から: ETH の量で ${pctText(d)}${nowJ ? `（${signedYen((all - prev) * nowJ)}）` : ""}`);
   }
-  return { line, all };
+  return { line: lines.join("\n"), all };
 }
 
 function priceText(v, n) {
@@ -322,16 +388,22 @@ async function main() {
   // withResult: 成績（ETH 換算）も付ける。save: 「前回の報告」として記録する
   const describeAll = async ({ withResult = false, save = false } = {}) => {
     const lines = [];
+    const nowJ = withResult ? await jpyNow() : null;
+    const sum = { inYen: 0, nowYen: 0, opYen: 0, count: 0 };
     for (const [i, v] of vaults.entries()) {
       lines.push(describe(v, await snapshot(v)));
       if (!withResult) continue;
       try {
-        const { line, all } = resultText(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0);
+        const { line, all } = await resultText(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0, nowJ, sum);
         lines.push(line);
         if (save) state.lastTotal[v.addr.toLowerCase()] = all;
       } catch (e) {
         lines.push(`　（成績の計算に失敗しました: ${shortErr(e)}）`);
       }
+    }
+    if (sum.count >= 2) {
+      const g = sum.nowYen - sum.inYen, pct = (g / sum.inYen) * 100;
+      lines.push(`【全部の合計】入れたお金 ${yenText(sum.inYen)} → 今 ${yenText(sum.nowYen)}：${mark(pct, 0.05)} ${signedYen(g)}（${pctText(pct)}）／ うち運用の成果 ${mark(sum.opYen, 0.5)} ${signedYen(sum.opYen)}`);
     }
     if (save) saveState(state);
     return lines.join("\n");
