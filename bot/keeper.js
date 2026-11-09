@@ -317,6 +317,16 @@ const mdDay = (iso) => (iso ? new Date(Date.parse(iso) + 9 * 3600e3).toISOString
 export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   const k = v.addr.toLowerCase();
   const dep = loadDeposits()[k] || {};
+  // 入れ直した（入れた記録の時刻が変わった）ら、前の回の「財布へ送った手数料」と「前回の報告」は数えない
+  if (dep.at) {
+    st.depAt ||= {};
+    if (st.depAt[k] !== dep.at) {
+      st.depAt[k] = dep.at;
+      if (st.sentToOwnerEth) delete st.sentToOwnerEth[k];
+      if (st.lastTotal) delete st.lastTotal[k];
+      saveState(st);
+    }
+  }
   const start = Number(dep.eth) > 0 ? Number(dep.eth) : startEnv;
   const sent = st.sentToOwnerEth?.[k] || 0;
   const all = totalEth + sent;
@@ -359,7 +369,9 @@ export function recordDaily(st, day, list) {
 }
 // month（例 "2026-10"）が始まる直前の記録。なければ入れたときの数字を使う
 function baseOf(st, addr, month, p) {
-  const keys = Object.keys(st.daily || {}).filter((k) => k < `${month}-01`).sort();
+  // 入れた日より前の記録（前の回の数字）は使わない
+  const depDay = p.depTs ? new Date(p.depTs + 9 * 3600e3).toISOString().slice(0, 10) : "";
+  const keys = Object.keys(st.daily || {}).filter((k) => k < `${month}-01` && k > depDay).sort();
   for (let i = keys.length - 1; i >= 0; i--) {
     const b = st.daily[keys[i]]?.[addr];
     if (b) return { all: b.all, yen: b.yen };
@@ -446,6 +458,8 @@ export function vaultEmbed(x) {
     lines.push(`増えた量 ${mark(p.pctEth, 0.05)} ${pctText(p.pctEth)}`);
   } else if (p) {
     lines.push(`今 **${p.all.toFixed(6)} ETH**`);
+  } else if (s.pid === 0n) {
+    lines.push("空です（今は使っていません。成績の合計にも入れていません）");
   } else {
     lines.push("成績を計算できませんでした");
   }
@@ -501,7 +515,8 @@ async function main() {
     for (const [i, v] of vaults.entries()) {
       const s = await snapshot(v);
       let p = null;
-      try {
+      // 空の金庫（運用していない）は成績に含めない
+      if (s.pid !== 0n) try {
         p = await perfOf(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0, nowJ);
         if (save) state.lastTotal[v.addr.toLowerCase()] = p.all;
       } catch (e) {
