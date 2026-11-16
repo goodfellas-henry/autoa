@@ -609,6 +609,8 @@ async function main() {
     if (save) saveState(state);
     return list;
   };
+  // カードを普通の文字に直す（スマホの「テキストをコピー」でそのままコピーできるように）
+  const asText = (e) => [`**${e.title}**`, e.description, e.footer?.text ? `\n${e.footer.text}` : ""].filter(Boolean).join("\n").slice(0, 1990);
   // Aave の残高（読めなくても報告は止めない）
   let ownerAddr = null;
   const aaveSafe = async () => {
@@ -620,8 +622,9 @@ async function main() {
       return null;
     }
   };
-  const footer = (bal) => {
-    const sent = Object.values(state.sentToOwnerEth || {}).some((n) => n > 0);
+  const footer = (bal, list = []) => {
+    // 動いている金庫に「財布へ送った手数料」があるときだけ注記する
+    const sent = list.some((x) => x.s.pid !== 0n && (state.sentToOwnerEth?.[x.v.addr.toLowerCase()] || 0) > 0);
     return { text: `⛽ ロボットのガス代の残り ${Number(ethers.formatEther(bal)).toFixed(5)} ETH${sent ? " ・ 財布へ送った手数料も成績に含めています" : ""}` };
   };
 
@@ -639,8 +642,8 @@ async function main() {
     const list = await gather();
     const bal = await read(() => provider.getBalance(wallet.address));
     const sum = summaryEmbed("今の成績", list, state, { aave: await aaveSafe() });
-    sum.footer = footer(bal);
-    await notify({ content: `🤖 ロボットを起動しました（金庫 ${vaults.length} 個）`, embeds: [sum] });
+    sum.footer = footer(bal, list);
+    await notify({ content: `🤖 ロボットを起動しました（金庫 ${vaults.length} 個）\n\n${asText(sum)}`.slice(0, 1990) });
   }
 
   let lastReport = Date.now();
@@ -768,10 +771,12 @@ async function main() {
       const [y, m, d] = jstDay().split("-");
       // 動いている金庫が2つ以上のときだけ、金庫ごとのカードも付ける（空の金庫は出さない）
       const active = list.filter((x) => x.s.pid !== 0n);
-      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state, { reinvested, aave: await aaveSafe() }), ...(active.length > 1 ? active.map(vaultEmbed) : [])];
+      const sum = summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state, { reinvested, aave: await aaveSafe() });
       reinvested = false;
-      embeds[embeds.length - 1].footer = footer(bal);
-      await notify({ embeds });
+      sum.footer = footer(bal, list);
+      // まとめは普通の文字で送る（コピーできるように）。金庫が2つ以上動いているときだけ、金庫ごとのカードを付ける
+      const vaultCards = active.length > 1 ? active.map(vaultEmbed) : [];
+      await notify(vaultCards.length ? { content: asText(sum), embeds: vaultCards } : { content: asText(sum) });
       // 月の初めの報告では、先月のまとめも送る
       if (d === "01") {
         const prev = new Date(Date.UTC(Number(y), Number(m) - 2, 1)).toISOString().slice(0, 7);
