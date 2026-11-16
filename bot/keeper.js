@@ -410,37 +410,61 @@ export function monthlyPace(list) {
   return { perMonth, pct: (perMonth / inY) * 100, days };
 }
 
-// 全体のまとめのカード
-export function summaryEmbed(title, list, st = null) {
+// 全体のまとめのカード（ひと目で分かるように、一言まとめ→今のお金→内訳→ペース→金庫の様子の順）
+// opt.reinvested：今回、手数料を金庫に戻して再投資したか
+export function summaryEmbed(title, list, st = null, opt = {}) {
   const ok = list.filter((x) => x.p?.gain != null);
   if (!ok.length) {
     return { title, color: COLOR.gray, description: list.map((x) => `金庫${x.no} ${x.p ? `${x.p.all.toFixed(6)} ETH` : "計算できませんでした"}`).join("\n") + "\n（円の値段を取得できませんでした）" };
   }
   const sum = (f) => ok.reduce((a, x) => a + (x.p[f] || 0), 0);
   const inY = sum("inYen"), nowY = sum("nowYen"), g = nowY - inY, pct = (g / inY) * 100, op = sum("opYen"), pr = sum("priceYen");
-  const lines = [
-    `**今のお金　${yenText(nowY)}**`,
-    `入れたお金　${yenText(inY)}`,
+  const lines = [];
+  // 一言まとめ
+  if (op < -0.5) lines.push("手数料の稼ぎは、入れた時の交換手数料を取り返している途中です。");
+  else if (pr < -0.5) lines.push("手数料は順調に稼げています。減っているのは、ETH の値段が下がった分です。");
+  else lines.push("手数料も ETH の値段も、どちらもプラスです。");
+  lines.push(
     "",
-    `**増えた金額　${mark(g, 0.5)} ${signedYen(g)}**（${pctText(pct)}）`,
-    `├ 運用の成果　${mark(op, 0.5)} ${signedYen(op)}`,
-    `└ ETH の値動き　${mark(pr, 0.5)} ${signedYen(pr)}`,
-  ];
+    `💴 **今のお金　${yenText(nowY)}**`,
+    `入れたお金 ${yenText(inY)} → **${signedYen(g)}**（${pctText(pct)}）`,
+    "",
+    "**内訳**",
+    `${op >= 0 ? "✅" : "🔻"} 手数料で稼いだ分　${signedYen(op)}`,
+    `${pr >= 0 ? "📈" : "📉"} ETH の値動きの分　${signedYen(pr)}`,
+  );
+  const pace = monthlyPace(list);
+  if (pace && pace.perMonth > 0) {
+    lines.push("", "**稼ぐペース**", `1日 約${yenText(pace.perMonth / 30)} → 1か月で 約${yenText(pace.perMonth)}（入れたお金の ${pace.pct.toFixed(1)}%）`);
+    if (pace.days < 14) lines.push(`（始めて${Math.floor(pace.days)}日分からの目安です）`);
+  }
   const withPrev = ok.filter((x) => x.p.prevYen != null);
   if (withPrev.length) {
     const d = withPrev.reduce((a, x) => a + x.p.prevYen, 0);
     lines.push("", `前回の報告から　${mark(d, 0.5)} ${signedYen(d)}`);
   }
+  // 今月の増減は、先月より前から入れている金庫があるときだけ出す（今月入れただけなら上の数字と同じなので）
   if (st) {
     const month = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 7);
-    const ms = monthStats(st, month, list);
-    const pace = monthlyPace(list);
-    if (ms || pace) lines.push("");
-    if (ms) lines.push(`**今月（${Number(month.slice(5))}月）**　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)} ／ うち運用の成果 ${mark(ms.op, 0.5)} ${signedYen(ms.op)}`);
-    if (pace) lines.push(`**1か月あたりのペース**　運用の成果 約 ${signedYen(pace.perMonth)}（月 ${pctText(pace.pct)}）`);
-    if (pace && pace.days < 14) lines.push(`（始めて${Math.floor(pace.days)}日分からの目安です）`);
+    const older = ok.some((x) => x.p.depTs && new Date(x.p.depTs + 9 * 3600e3).toISOString().slice(0, 7) < month);
+    const ms = older ? monthStats(st, month, list) : null;
+    if (ms) lines.push(`今月（${Number(month.slice(5))}月）　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)}（うち手数料 ${signedYen(ms.op)}）`);
   }
+  // 金庫の様子（空の金庫は出さない）
+  const active = list.filter((x) => x.s.pid !== 0n);
+  if (active.length) {
+    lines.push("");
+    for (const x of active) lines.push(statusLine(x));
+  }
+  if (opt.reinvested) lines.push("🔁 手数料は金庫に戻して、再投資しました");
   return { title, color: g >= 0 ? COLOR.good : COLOR.bad, description: lines.join("\n") };
+}
+
+// 金庫の様子を1行で
+export function statusLine(x) {
+  const { v, no, s } = x;
+  const state = s.paused ? "⏸ 一時停止中" : s.inRange ? "✅ 範囲内（手数料が入っています）" : "⚠️ 範囲外（ロボットが置き直します）";
+  return `金庫${no} ${state}\n　${v.base} ${priceText(v, s.price)}（範囲 ${priceText(v, s.lo)}〜${priceText(v, s.hi)}）`;
 }
 
 // 金庫ごとのカード
@@ -527,7 +551,10 @@ async function main() {
     if (save) saveState(state);
     return list;
   };
-  const footer = (bal) => ({ text: `ガス代残高 ${Number(ethers.formatEther(bal)).toFixed(5)} ETH ・ 今のお金には財布へ送った手数料も含みます` });
+  const footer = (bal) => {
+    const sent = Object.values(state.sentToOwnerEth || {}).some((n) => n > 0);
+    return { text: `⛽ ロボットのガス代の残り ${Number(ethers.formatEther(bal)).toFixed(5)} ETH${sent ? " ・ 財布へ送った手数料も成績に含めています" : ""}` };
+  };
 
   if (process.argv.includes("--status")) {
     for (const x of await gather()) {
@@ -629,6 +656,7 @@ async function main() {
   }
 
   let collected = [];
+  let reinvested = false;
   async function round() {
     await flushPending();
     collected = [];
@@ -654,7 +682,9 @@ async function main() {
       }
     }
 
-    if (collected.length) {
+    // 金庫に戻して再投資しただけなら、別のお知らせは出さず、毎日の報告に1行で書く
+    if (collected.length && collected.every((t) => t.includes("金庫に保管"))) reinvested = true;
+    else if (collected.length) {
       await notify({ embeds: [{ title: "💰 手数料を回収しました", color: COLOR.info, description: collected.join("\n"), timestamp: new Date().toISOString() }] });
     }
 
@@ -667,7 +697,10 @@ async function main() {
       state.lastReportDay = jstDay();
       const list = await gather({ save: true });
       const [y, m, d] = jstDay().split("-");
-      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state), ...list.map(vaultEmbed)];
+      // 動いている金庫が2つ以上のときだけ、金庫ごとのカードも付ける（空の金庫は出さない）
+      const active = list.filter((x) => x.s.pid !== 0n);
+      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state, { reinvested }), ...(active.length > 1 ? active.map(vaultEmbed) : [])];
+      reinvested = false;
       embeds[embeds.length - 1].footer = footer(bal);
       await notify({ embeds });
       // 月の初めの報告では、先月のまとめも送る
