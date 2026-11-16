@@ -313,6 +313,58 @@ const COLOR = { good: 0x2ecc71, bad: 0xe5534b, gray: 0x5865f2, warn: 0xf0b232, i
 const NUM = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
 const mdDay = (iso) => (iso ? new Date(Date.parse(iso) + 9 * 3600e3).toISOString().slice(5, 10).replace("-", "/").replace(/^0/, "") : "");
 
+// ---------------------------------------------------------------- Aave（守る役）の残高（読むだけ）
+// Base の Aave に預けた USDC。預けた証明の aUSDC の残高は、利息がつくと毎秒少しずつ増える
+const AAVE_AUSDC = "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB";
+// USDC 1枚の円の値段（今）
+export async function usdJpyNow() {
+  try {
+    const v = (await getJson("https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=jpy"))?.["usd-coin"]?.jpy;
+    return v > 0 ? v : null;
+  } catch (_) { return null; }
+}
+// 預けた時刻の USDC の円の値段（一度調べたら記録しておく）
+async function usdJpyAt(st, ts) {
+  if (!(ts > 0)) return null;
+  st.usdJpyAt ||= {};
+  const key = String(Math.round(ts / 60e3));
+  if (st.usdJpyAt[key] > 0) return st.usdJpyAt[key];
+  try {
+    const from = Math.floor(ts / 1000) - 3600, to = Math.floor(ts / 1000) + 3600;
+    const prices = (await getJson(`https://api.coingecko.com/api/v3/coins/usd-coin/market_chart/range?vs_currency=jpy&from=${from}&to=${to}`))?.prices || [];
+    let best = null;
+    for (const [t, v] of prices) if (v > 0 && (!best || Math.abs(t - ts) < Math.abs(best[0] - ts))) best = [t, v];
+    if (best) { st.usdJpyAt[key] = best[1]; saveState(st); return best[1]; }
+  } catch (_) {}
+  return null;
+}
+function loadAaveDeposit() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(here, "deposits.json"), "utf8"))?.aave_usdc;
+    return Number(d?.usdc) > 0 ? d : null;
+  } catch (_) { return null; }
+}
+// Aave の成績（預けた記録が deposits.json の aave_usdc にあるときだけ）
+export async function aaveOf(st, owner, provider) {
+  const dep = loadAaveDeposit();
+  if (!dep || !owner) return null;
+  const token = new ethers.Contract(AAVE_AUSDC, ["function balanceOf(address) view returns (uint256)"], provider);
+  const bal = Number(await read(() => token.balanceOf(owner))) / 1e6;
+  const usdc = Number(dep.usdc);
+  const nowU = await usdJpyNow();
+  const r = { bal, usdc, interest: bal - usdc };
+  if (nowU) {
+    const thenU = Number(dep.jpy) > 0 ? Number(dep.jpy) / usdc : await usdJpyAt(st, Date.parse(dep.at || ""));
+    r.nowYen = bal * nowU;
+    r.interestYen = r.interest * nowU;
+    if (thenU) {
+      r.inYen = usdc * thenU;
+      r.fxYen = r.nowYen - r.inYen - r.interestYen;
+    }
+  }
+  return r;
+}
+
 // 1つの金庫の成績を数字で返す
 export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   const k = v.addr.toLowerCase();
@@ -418,7 +470,10 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
     return { title, color: COLOR.gray, description: list.map((x) => `金庫${x.no} ${x.p ? `${x.p.all.toFixed(6)} ETH` : "計算できませんでした"}`).join("\n") + "\n（円の値段を取得できませんでした）" };
   }
   const sum = (f) => ok.reduce((a, x) => a + (x.p[f] || 0), 0);
-  const inY = sum("inYen"), nowY = sum("nowYen"), g = nowY - inY, pct = (g / inY) * 100, op = sum("opYen"), pr = sum("priceYen");
+  const a = opt.aave?.inYen != null ? opt.aave : null;
+  const vIn = sum("inYen"), vNow = sum("nowYen");
+  const inY = vIn + (a ? a.inYen : 0), nowY = vNow + (a ? a.nowYen : 0);
+  const g = nowY - inY, pct = (g / inY) * 100, op = sum("opYen"), pr = sum("priceYen");
   const lines = [];
   // 一言まとめ
   if (op < -0.5) lines.push("手数料の稼ぎは、入れた時の交換手数料を取り返している途中です。");
@@ -433,9 +488,13 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
     `${op >= 0 ? "✅" : "🔻"} 手数料で稼いだ分　${signedYen(op)}`,
     `${pr >= 0 ? "📈" : "📉"} ETH の値動きの分　${signedYen(pr)}`,
   );
+  if (a) {
+    lines.push(`🏦 Aave の利息　${signedYen(a.interestYen)}`);
+    if (Math.abs(a.fxYen) >= 1) lines.push(`💱 ドルと円の動きの分　${signedYen(a.fxYen)}`);
+  }
   const pace = monthlyPace(list);
   if (pace && pace.perMonth > 0) {
-    lines.push("", "**稼ぐペース**", `1日 約${yenText(pace.perMonth / 30)} → 1か月で 約${yenText(pace.perMonth)}（入れたお金の ${pace.pct.toFixed(1)}%）`);
+    lines.push("", "**稼ぐペース**", `1日 約${yenText(pace.perMonth / 30)} → 1か月で 約${yenText(pace.perMonth)}（金庫に入れたお金の ${pace.pct.toFixed(1)}%）`);
     if (pace.days < 14) lines.push(`（始めて${Math.floor(pace.days)}日分からの目安です）`);
   }
   const withPrev = ok.filter((x) => x.p.prevYen != null);
@@ -450,12 +509,11 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
     const ms = older ? monthStats(st, month, list) : null;
     if (ms) lines.push(`今月（${Number(month.slice(5))}月）　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)}（うち手数料 ${signedYen(ms.op)}）`);
   }
-  // 金庫の様子（空の金庫は出さない）
+  // 置き場所ごとの様子（空の金庫は出さない）
   const active = list.filter((x) => x.s.pid !== 0n);
-  if (active.length) {
-    lines.push("");
-    for (const x of active) lines.push(statusLine(x));
-  }
+  if (active.length || a) lines.push("", "**置き場所**");
+  for (const x of active) lines.push(`${statusLine(x)}\n　今 ${yenText(x.p?.nowYen ?? 0)}（入れたお金 ${yenText(x.p?.inYen ?? 0)}）`);
+  if (a) lines.push(`🏦 Aave（守る役）\n　今 ${yenText(a.nowYen)}＝${a.bal.toFixed(2)} ドル（預けた分 ${a.usdc.toFixed(2)} ドル、利息 +${a.interest.toFixed(4)} ドル）`);
   if (opt.reinvested) lines.push("🔁 手数料は金庫に戻して、再投資しました");
   return { title, color: g >= 0 ? COLOR.good : COLOR.bad, description: lines.join("\n") };
 }
@@ -551,6 +609,17 @@ async function main() {
     if (save) saveState(state);
     return list;
   };
+  // Aave の残高（読めなくても報告は止めない）
+  let ownerAddr = null;
+  const aaveSafe = async () => {
+    try {
+      ownerAddr ||= await read(() => vaults[0].vault.owner());
+      return await aaveOf(state, ownerAddr, provider);
+    } catch (e) {
+      log("Aave の残高を読めませんでした:", shortErr(e));
+      return null;
+    }
+  };
   const footer = (bal) => {
     const sent = Object.values(state.sentToOwnerEth || {}).some((n) => n > 0);
     return { text: `⛽ ロボットのガス代の残り ${Number(ethers.formatEther(bal)).toFixed(5)} ETH${sent ? " ・ 財布へ送った手数料も成績に含めています" : ""}` };
@@ -569,7 +638,7 @@ async function main() {
   {
     const list = await gather();
     const bal = await read(() => provider.getBalance(wallet.address));
-    const sum = summaryEmbed("今の成績", list, state);
+    const sum = summaryEmbed("今の成績", list, state, { aave: await aaveSafe() });
     sum.footer = footer(bal);
     await notify({ content: `🤖 ロボットを起動しました（金庫 ${vaults.length} 個）`, embeds: [sum] });
   }
@@ -699,7 +768,7 @@ async function main() {
       const [y, m, d] = jstDay().split("-");
       // 動いている金庫が2つ以上のときだけ、金庫ごとのカードも付ける（空の金庫は出さない）
       const active = list.filter((x) => x.s.pid !== 0n);
-      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state, { reinvested }), ...(active.length > 1 ? active.map(vaultEmbed) : [])];
+      const embeds = [summaryEmbed(`📊 ${Number(m)}月${Number(d)}日の成績`, list, state, { reinvested, aave: await aaveSafe() }), ...(active.length > 1 ? active.map(vaultEmbed) : [])];
       reinvested = false;
       embeds[embeds.length - 1].footer = footer(bal);
       await notify({ embeds });
