@@ -365,6 +365,61 @@ export async function aaveOf(st, owner, provider) {
   return r;
 }
 
+// ---------------------------------------------------------------- 本当に入った手数料
+// 金庫は手数料を回収するたびに FeesCollected を残す（範囲の置き直しの時も、閉じる前に手数料だけ先に回収して残す）。
+// 入れた時刻から後のこの記録を足し上げ、まだ回収していない分も足す。記録は state.json に覚えておき、次からは続きだけ読む。
+const FEES_TOPIC = ethers.id("FeesCollected(uint256,uint256,bool)");
+const FEES_IFACE = new ethers.Interface(["event FeesCollected(uint256 amount0, uint256 amount1, bool sentToOwner)"]);
+export async function feesSince(v, provider, st, depAt) {
+  const ts = Date.parse(depAt || "") / 1000;
+  if (!(ts > 0)) return null;
+  const k = v.addr.toLowerCase();
+  st.feeScan ||= {};
+  let f = st.feeScan[k];
+  if (!f || f.depAt !== depAt) {
+    const top = await read(() => provider.getBlock("latest"));
+    // Base は 2 秒に 1 ブロック。少し手前（1時間分）から読み、時刻で入れる前の分を外す
+    const from = Math.max(0, top.number - Math.ceil((top.timestamp - ts) / 2) - 1800);
+    f = st.feeScan[k] = { depAt, next: from, raw0: "0", raw1: "0" };
+  }
+  const latest = await read(() => provider.getBlockNumber());
+  let step = 10000;
+  while (f.next <= latest) {
+    const to = Math.min(f.next + step - 1, latest);
+    let logs;
+    try {
+      logs = await provider.getLogs({ address: v.addr, topics: [FEES_TOPIC], fromBlock: f.next, toBlock: to });
+    } catch (e) {
+      if (step > 500) { step = Math.floor(step / 2); continue; }
+      saveState(st);
+      throw e;
+    }
+    for (const l of logs) {
+      const b = await read(() => provider.getBlock(l.blockNumber));
+      if (b.timestamp < ts) continue;
+      const e = FEES_IFACE.parseLog(l);
+      f.raw0 = (BigInt(f.raw0) + e.args.amount0).toString();
+      f.raw1 = (BigInt(f.raw1) + e.args.amount1).toString();
+    }
+    f.next = to + 1;
+  }
+  saveState(st);
+  let r0 = BigInt(f.raw0), r1 = BigInt(f.raw1);
+  // まだ回収していない手数料
+  const pid = await read(() => v.vault.positionId());
+  if (pid !== 0n) {
+    try {
+      const r = await read(() =>
+        v.npm.collect.staticCall({ tokenId: pid, recipient: v.addr, amount0Max: MAX128, amount1Max: MAX128 }, { from: v.addr })
+      );
+      r0 += r[0]; r1 += r[1];
+    } catch (_) {}
+  }
+  const slot = await read(() => v.pool.slot0());
+  const sqrtP = Number(slot.sqrtPriceX96) / 2 ** 96;
+  return toEth(v, Number(r0), Number(r1), sqrtP);
+}
+
 // 1つの金庫の成績を数字で返す
 export async function perfOf(v, totalEth, st, startEnv, nowJ) {
   const k = v.addr.toLowerCase();
@@ -454,7 +509,7 @@ export function monthlyPace(list) {
   for (const x of list) {
     const p = x.p;
     if (p?.opYen == null || !p.depTs) continue;
-    op += p.opYen; inY += p.inYen;
+    op += p.feeYen ?? p.opYen; inY += p.inYen;
     days = Math.min(days, (Date.now() - p.depTs) / 864e5);
   }
   if (!(inY > 0) || !(days >= 1)) return null;
@@ -474,9 +529,13 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
   const vIn = sum("inYen"), vNow = sum("nowYen");
   const inY = vIn + (a ? a.inYen : 0), nowY = vNow + (a ? a.nowYen : 0);
   const g = nowY - inY, pct = (g / inY) * 100, op = sum("opYen"), pr = sum("priceYen");
+  // 本当に入った手数料が全部の金庫で分かる時だけ、手数料と往復の損を分けて出す
+  const hasFee = ok.every((x) => x.p.feeYen != null);
+  const fee = hasFee ? sum("feeYen") : null, swing = hasFee ? sum("swingYen") : null;
   const lines = [];
   // 一言まとめ
-  if (op < -0.5) lines.push("手数料の稼ぎは、入れた時の交換手数料を取り返している途中です。");
+  if (hasFee && swing < -0.5 && fee + swing < -0.5) lines.push("手数料は入っています。ただ、値段の往復による損の方が今は大きく、その分マイナスです。");
+  else if (!hasFee && op < -0.5) lines.push("手数料と値段の往復の差し引きが、今はマイナスです。");
   else if (pr < -0.5) lines.push("手数料は順調に稼げています。減っているのは、ETH の値段が下がった分です。");
   else lines.push("手数料も ETH の値段も、どちらもプラスです。");
   lines.push(
@@ -485,7 +544,9 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
     `入れたお金 ${yenText(inY)} → **${signedYen(g)}**（${pctText(pct)}）`,
     "",
     "**内訳**",
-    `${op >= 0 ? "✅" : "🔻"} 手数料で稼いだ分　${signedYen(op)}`,
+    ...(hasFee
+      ? [`✅ 入った手数料　${signedYen(fee)}`, `🔄 値段の往復による${swing < 0 ? "損" : "差"}　${signedYen(swing)}`]
+      : [`${op >= 0 ? "✅" : "🔻"} 手数料と往復の差し引き　${signedYen(op)}`]),
     `${pr >= 0 ? "📈" : "📉"} ETH の値動きの分　${signedYen(pr)}`,
   );
   if (a) {
@@ -494,7 +555,7 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
   }
   const pace = monthlyPace(list);
   if (pace && pace.perMonth > 0) {
-    lines.push("", "**稼ぐペース**", `1日 約${yenText(pace.perMonth / 30)} → 1か月で 約${yenText(pace.perMonth)}（金庫に入れたお金の ${pace.pct.toFixed(1)}%）`);
+    lines.push("", hasFee ? "**稼ぐペース（入った手数料）**" : "**稼ぐペース**", `1日 約${yenText(pace.perMonth / 30)} → 1か月で 約${yenText(pace.perMonth)}（金庫に入れたお金の ${pace.pct.toFixed(1)}%）`);
     if (pace.days < 14) lines.push(`（始めて${Math.floor(pace.days)}日分からの目安です）`);
   }
   const withPrev = ok.filter((x) => x.p.prevYen != null);
@@ -507,7 +568,7 @@ export function summaryEmbed(title, list, st = null, opt = {}) {
     const month = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 7);
     const older = ok.some((x) => x.p.depTs && new Date(x.p.depTs + 9 * 3600e3).toISOString().slice(0, 7) < month);
     const ms = older ? monthStats(st, month, list) : null;
-    if (ms) lines.push(`今月（${Number(month.slice(5))}月）　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)}（うち手数料 ${signedYen(ms.op)}）`);
+    if (ms) lines.push(`今月（${Number(month.slice(5))}月）　${mark(ms.gain, 0.5)} ${signedYen(ms.gain)}（うち手数料と往復の差し引き ${signedYen(ms.op)}）`);
   }
   // 置き場所ごとの様子（空の金庫は出さない）
   const active = list.filter((x) => x.s.pid !== 0n);
@@ -601,6 +662,17 @@ async function main() {
       if (s.pid !== 0n) try {
         p = await perfOf(v, await valueInEth(v, provider), state, cfg.startEth[i] || 0, nowJ);
         if (save) state.lastTotal[v.addr.toLowerCase()] = p.all;
+        // 本当に入った手数料と、値段の往復による損を分ける（読めなくても報告は止めない）
+        try {
+          const dep = loadDeposits()[v.addr.toLowerCase()] || {};
+          const feeEth = await feesSince(v, provider, state, dep.at);
+          if (feeEth != null && nowJ && p.opYen != null) {
+            p.feeYen = feeEth * nowJ;
+            p.swingYen = p.opYen - p.feeYen;
+          }
+        } catch (e) {
+          log(`[${v.name}] 手数料の記録を読めませんでした:`, shortErr(e));
+        }
       } catch (e) {
         log(`[${v.name}] 成績の計算に失敗:`, shortErr(e));
       }
