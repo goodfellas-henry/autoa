@@ -370,9 +370,11 @@ export async function aaveOf(st, owner, provider) {
 // 入れた時刻から後のこの記録を足し上げ、まだ回収していない分も足す。記録は state.json に覚えておき、次からは続きだけ読む。
 const FEES_TOPIC = ethers.id("FeesCollected(uint256,uint256,bool)");
 const FEES_IFACE = new ethers.Interface(["event FeesCollected(uint256 amount0, uint256 amount1, bool sentToOwner)"]);
-export async function feesSince(v, provider, st, depAt) {
+// 記録を少しずつ読み進める（公開の接続先は一度にたくさん読むと断られるので、1回に読む量と回数を絞る）。
+// 読み終わっていれば true。途中まで読んだ所は state.json に覚えておき、次はその続きから読む。
+export async function scanFees(v, provider, st, depAt, maxChunks = 5) {
   const ts = Date.parse(depAt || "") / 1000;
-  if (!(ts > 0)) return null;
+  if (!(ts > 0)) return false;
   const k = v.addr.toLowerCase();
   st.feeScan ||= {};
   let f = st.feeScan[k];
@@ -380,30 +382,47 @@ export async function feesSince(v, provider, st, depAt) {
     const top = await read(() => provider.getBlock("latest"));
     // Base は 2 秒に 1 ブロック。少し手前（1時間分）から読み、時刻で入れる前の分を外す
     const from = Math.max(0, top.number - Math.ceil((top.timestamp - ts) / 2) - 1800);
-    f = st.feeScan[k] = { depAt, next: from, raw0: "0", raw1: "0" };
+    f = st.feeScan[k] = { depAt, next: from, raw0: "0", raw1: "0", step: 2000 };
   }
+  f.step ||= 2000;
   const latest = await read(() => provider.getBlockNumber());
-  let step = 10000;
-  while (f.next <= latest) {
-    const to = Math.min(f.next + step - 1, latest);
-    let logs;
-    try {
-      logs = await provider.getLogs({ address: v.addr, topics: [FEES_TOPIC], fromBlock: f.next, toBlock: to });
-    } catch (e) {
-      if (step > 500) { step = Math.floor(step / 2); continue; }
-      saveState(st);
-      throw e;
+  let chunks = 0;
+  try {
+    while (f.next <= latest && chunks < maxChunks) {
+      const to = Math.min(f.next + f.step - 1, latest);
+      let logs;
+      try {
+        logs = await read(() => provider.getLogs({ address: v.addr, topics: [FEES_TOPIC], fromBlock: f.next, toBlock: to }), 2);
+      } catch (e) {
+        // 断られたら、次からは読む幅を半分にする
+        if (f.step > 200) f.step = Math.floor(f.step / 2);
+        f.maxStep = f.step;
+        throw e;
+      }
+      for (const l of logs) {
+        const b = await read(() => provider.getBlock(l.blockNumber));
+        if (b.timestamp < ts) continue;
+        const e = FEES_IFACE.parseLog(l);
+        f.raw0 = (BigInt(f.raw0) + e.args.amount0).toString();
+        f.raw1 = (BigInt(f.raw1) + e.args.amount1).toString();
+      }
+      f.next = to + 1;
+      chunks++;
+      // うまく読めたら、次は少し広く読む（最大 10,000 ブロック）
+      if (f.step < (f.maxStep || 10000)) f.step = Math.min(f.maxStep || 10000, f.step * 2);
+      await sleep(300);
     }
-    for (const l of logs) {
-      const b = await read(() => provider.getBlock(l.blockNumber));
-      if (b.timestamp < ts) continue;
-      const e = FEES_IFACE.parseLog(l);
-      f.raw0 = (BigInt(f.raw0) + e.args.amount0).toString();
-      f.raw1 = (BigInt(f.raw1) + e.args.amount1).toString();
-    }
-    f.next = to + 1;
+  } finally {
+    saveState(st);
   }
-  saveState(st);
+  // 1分ほどの遅れは読み終わったものとみなす
+  return latest - f.next < 60;
+}
+
+// 入れた時刻から後に入った手数料（ETH の量で）。まだ読み終わっていなければ null
+export async function feesSince(v, provider, st, depAt) {
+  if (!(await scanFees(v, provider, st, depAt, 5))) return null;
+  const f = st.feeScan[v.addr.toLowerCase()];
   let r0 = BigInt(f.raw0), r1 = BigInt(f.raw1);
   // まだ回収していない手数料
   const pid = await read(() => v.vault.positionId());
@@ -812,6 +831,16 @@ async function main() {
 
     // 1つの金庫で問題が起きても、他の金庫は止めない
     for (const v of vaults) {
+      // 手数料の記録がまだ読み終わっていなければ、見回りのついでに少しずつ読み進める（失敗しても次の見回りで続ける）
+      try {
+        const k = v.addr.toLowerCase(), dep = loadDeposits()[k] || {};
+        if (dep.at) {
+          const done = await scanFees(v, provider, state, dep.at, 3);
+          if (done && !state.feeScan[k].done) { state.feeScan[k].done = true; saveState(state); log(`[${v.name}] 手数料の記録を読み終わりました`); }
+        }
+      } catch (e) {
+        log(`[${v.name}] 手数料の記録の読み込みは次の見回りで続けます:`, shortErr(e));
+      }
       try {
         await checkVault(v);
         errors.set(v.addr, 0);
